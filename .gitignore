@@ -1,0 +1,20 @@
+# Installed dependencies. A checkout linked into a DSH profile may also carry a
+# node_modules junction to a local @deepseek-ai/schemastery; neither is source.
+node_modules/
+
+# Install and run residue.
+*.log
+npm-debug.log*
+pnpm-debug.log*
+.npm/
+
+# Editor and OS noise.
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# lib/ is NOT build output and must stay committed: the client half is authored
+# directly in the bundle format the DSH client module system serves, so this
+# package has no build step and lib/ is what the app loads.

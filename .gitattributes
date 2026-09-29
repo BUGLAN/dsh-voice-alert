@@ -1,0 +1,11 @@
+# One canonical text form: LF in the repository and in every checkout, so the
+# bundle a Windows author edits is byte-identical to the one CI runs.
+* text=auto eol=lf
+
+*.png binary
+*.gif binary
+*.jpg binary
+*.jpeg binary
+*.webp binary
+*.mp3 binary
+*.wav binary

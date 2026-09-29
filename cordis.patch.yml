@@ -1,0 +1,4 @@
+# dsh-voice-alert bundle layer: mounting the row that owns both halves.
+- insert:
+    - id: voice-alert
+      name: dsh-voice-alert

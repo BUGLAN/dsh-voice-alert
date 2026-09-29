@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.x
+      # @deepseek-ai/schemastery is the Host half's only dependency; the client
+      # half is served by the DSH host and needs nothing installed here.
+      - run: npm install --no-audit --no-fund --ignore-scripts
+      - run: node tests/smoke.mjs
+      - run: node tests/host.mjs

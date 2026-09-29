@@ -1,0 +1,61 @@
+{
+  "name": "dsh-voice-alert",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Play a sound when a dsh task finishes and when dsh is waiting for your reply, configurable from a Settings page",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": {
+      "default": "./lib/index.js"
+    },
+    "./client": {
+      "default": "./lib/client.js"
+    },
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "client": {
+      "platform": "web"
+    },
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "files": [
+    "lib/index.js",
+    "lib/client.js",
+    "cordis.patch.yml",
+    "README.md",
+    "README.zh-CN.md"
+  ],
+  "scripts": {
+    "test": "node tests/smoke.mjs && node tests/host.mjs"
+  },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "cordis",
+    "plugin",
+    "notification",
+    "sound",
+    "alert"
+  ],
+  "homepage": "https://github.com/BUGLAN/dsh-voice-alert#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/BUGLAN/dsh-voice-alert.git"
+  },
+  "bugs": {
+    "url": "https://github.com/BUGLAN/dsh-voice-alert/issues"
+  },
+  "author": "buglan",
+  "license": "MIT",
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  },
+  "dependencies": {
+    "@deepseek-ai/schemastery": "^3.18.4"
+  }
+}
