@@ -3,41 +3,69 @@
 [![CI](https://github.com/BUGLAN/dsh-voice-alert/actions/workflows/ci.yml/badge.svg)](https://github.com/BUGLAN/dsh-voice-alert/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-[DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 插件：任务结束时播放提示音，
-dsh 需要你回答或选择时播放另一种提示音，两者都可以额外弹出 Windows / macOS 系统通知，并在设置里
-新增一个「语音提醒」页面统一配置。
+[DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 插件：会话在侧边栏显示
+为已完成时播放一种提示音，侧边栏显示 dsh 需要你回答或选择时播放另一种，两者都可以额外弹出
+Windows / macOS 系统通知，并在设置里新增一个「语音提醒」页面统一配置。
 
 [English →](README.md)
 
 ## 功能
 
+两种提醒都抄写侧边栏自己的状态点：插件用与侧边栏相同的输入推导每一行的状态点，所以响声的含义
+就是状态点的含义。
+
 | 提醒 | 触发时机 | 默认 |
 |---|---|---|
-| 任务结束提示音（`chime-up`） | 一轮对话停下并且保持停止，且不是被你取消的 | 开 |
-| 需要你回复提示音（`ask-up`） | 会话出现待回答的问题或待授权 | 开 |
+| 完成提示音（`chime-up`） | 某个顶层会话行出现绿色状态点：没有待处理交互、会话自身未在运行、没有正在运行的直接子会话，且该会话的回合已结束 | 开 |
+| 需要你回复提示音（`ask-up`） | 某个顶层会话行出现黄色状态点：有待回答的问题、待确认的计划或待授权 | 开 |
 | 系统通知 | 上面两个时刻，弹 Windows / macOS 通知 | 关（需手动开启） |
 
-两个时刻都来自客户端的会话状态快照（`uiSession.sessionStatus`），它合并了
-`api-session/status` 事件与输入框上的待处理交互。若同一次更新里既有需要回复又有任务结束，只提醒
-需要回复。
+只有侧边栏真的会画出来的行才可能有状态点。本浏览器没有该会话目录行的（例如目录由别的窗口加载
+的 teammate）就是「未知」，未知行不会触发任何提醒；子代理会话或带 `parentId` 的会话同样不会，
+归档行与空白行也不会。
 
-一轮对话结束并不等于任务完成，所以「任务结束」还要满足两个条件：
+绿点不等于「回合结束了」，而是「活停了」：在 `completionDelayMs`（默认 1200 ms）内又开始的回合会
+取消自己的提醒；还有直接子会话在运行的会话，侧边栏显示的是转圈而不是绿点，所以父会话停下而
+teammate 还在跑时保持安静，直到最后一个子会话停下 —— 那一刻该行才变绿，并且只提醒一次。
 
-- **必须保持停止。** 会话空闲后再等 `completionDelayMs`（默认 1200 ms）才提醒。若在这段时间里
-  又开始了新一轮 —— goal 轮次、自动续跑、工具循环继续 —— 会取消自己的提醒，因此中途的停顿不会
-  被误报成任务完成。
-- **不能是被取消的。** 持久化日志记录了这轮为什么结束（`turn/end` 带有结束原因）：`completed`、
-  `blocked`、`max-tokens` 会提醒；`aborted`（用户、父 agent、hook 或销毁）、`interrupted`、
-  `forked` 保持安静；`error` 按失败提醒，而不是按完成提醒。
+回合的持久化日志记录了它为什么结束（`turn/end` 带有结束原因）：`completed`、`blocked`、
+`max-tokens` 会提醒；`aborted`（用户、父 agent、hook 或销毁）、`interrupted`、`forked` 保持安静。
+这份日志只用来细化状态信号已经给出的提醒，**它自己不会触发提醒** —— 第一次点开一个会话会把它的日志
+物化出来，而日志里最新一轮可能早在本页面存在之前就结束了。离开一个会话会释放本浏览器持有的该会话
+事件窗口，所以后台会话根本没有窗口：提醒照样由状态信号触发，只有依赖窗口的细节 —— 结束原因、失败
+信息、最新 prompt —— 退回到各自的默认值。
 
 ### 什么时候不提醒
 
 - 你按了停止 / 取消了这一轮（`aborted`，原因为 `user` 或 `parent`）；
 - 这一轮由崩溃修复或 fork 标记收尾（`interrupted`、`forked`）；
-- 这一轮属于内部运行：子 agent 或 teammate 会话（`origin: 'subagent'`，或任何带 `parentId` 的
-  会话），它们的结束在日常工作中非常频繁；
+- 该行属于内部运行：子 agent 或 teammate 会话（`origin: 'subagent'`，或任何带 `parentId` 的
+  会话），它们的结束在日常工作中非常频繁 —— 本浏览器根本没有它的目录行时同样不提醒；
+- 该行还有直接子会话在运行（侧边栏显示的是转圈，不是绿点）；
 - 在防抖时间内这一轮又继续了；
 - 对应的开关是关的、总开关是关的，或者开着 `notifyBackgroundOnly` 而窗口就在最前面。
+
+### 通知的标题与正文
+
+标题永远是该会话的 `displayTitle`，不带任何图标。正文以状态图标开头，后面才是「哪件事」：取该
+会话里**你自己发出的最新一条 prompt**，压成一行并限制在 120 字以内。所以完成通知读起来是你要的
+那件事，而不是会话自动生成的标题。user 角色的消息不一定是 prompt —— 注入的上下文（工作区说明、
+技能目录、teammate 框架文本）也是 user 角色 —— 因此只认 `source.kind === 'user'`。
+
+| 图标 | 含义 |
+|---|---|
+| `🐳` | 完成提醒，且这一轮正常结束 |
+| `🌀` | 完成提醒，且这一轮以错误结束 |
+| `❗` | 需要你回复的提醒（有待回答的问题、待确认的计划或待授权） |
+
+图标**始终在正文最前**，无论正文最终来自哪里 —— 你显式填写的覆盖文本、失败信息、最新 prompt，还是
+内置文案 —— 因为它表示的是「哪一类事件」，而不是正文内容。每个提醒的正文优先级不变：你显式填写的
+覆盖文本 →（以错误结束的那一轮）失败信息 → 最新 prompt → 内置文案。会话标题永远不会成为正文。
+设置页的 **发送测试通知** 按钮不是提醒，所以它的正文没有图标。
+
+**出错不是第三个提醒。** 它没有自己的标题、开关或音色：出错的那一轮照常走完成提醒，用完成音色和
+完成开关，错误信息只作为正文来源 —— 只是图标从 `🐳` 换成 `🌀`。字典里原来的错误标题与错误正文两条
+文案已删除。
 
 ## 环境要求
 
@@ -97,16 +125,6 @@ pnpm 会把实际拉取到的 commit 固定下来，所以要用 update 才能�
 当本插件已经为同一个事件播放过提示音时，系统通知会静音，所以不会听到两声；插件提示音关掉时，
 通知保留系统提示音。
 
-### 通知正文写什么
-
-正文说的是「哪件事」，而不是「哪个会话」：取该会话里**你自己发出的最新一条 prompt**，压成一行并
-限制在 120 字以内。所以完成通知读起来是你要的那件事，而不是会话自动生成的标题。user 角色的消息
-不一定是 prompt —— 注入的上下文（工作区说明、技能目录、teammate 框架文本）也是 user 角色 ——
-因此只认 `source.kind === 'user'`。
-
-每个提醒的正文优先级：你显式填写的覆盖文本 →（失败的那一轮）失败信息 → 最新 prompt → 会话标题 →
-内置文案。
-
 ## 配置项
 
 每个偏好都是本插件 entry 的 Config 字段，因此既能在设置页面里改，也能写在 profile 的
@@ -116,7 +134,7 @@ pnpm 会把实际拉取到的 commit 固定下来，所以要用 update 才能�
 |---|---|---|
 | `enabled` | boolean，`true` | 两个提示音的总开关 |
 | `volume` | number 0–1，`0.6` | 音量（满量程的比例） |
-| `completionEnabled` | boolean，`true` | 任务结束时播放提示音 |
+| `completionEnabled` | boolean，`true` | 会话行显示绿色状态点时播放提示音 |
 | `completionTone` | string，`chime-up` | 未设置自定义音频时使用的内置音色 |
 | `completionFile` | string，`''` | 自定义完成提示音，data URL |
 | `completionDelayMs` | number 0–60000，`1200` | 完成提醒的防抖时长；`0` 关闭防抖 |
@@ -124,11 +142,11 @@ pnpm 会把实际拉取到的 commit 固定下来，所以要用 update 才能�
 | `waitingTone` | string，`ask-up` | 未设置自定义音频时使用的内置音色 |
 | `waitingFile` | string，`''` | 自定义回复提示音，data URL |
 | `notifyEnabled` | boolean，`false` | 在提示音之外再弹系统通知 |
-| `notifyCompletion` | boolean，`true` | 任务完成时通知 |
+| `notifyCompletion` | boolean，`true` | 会话行显示绿色状态点时通知 |
 | `notifyWaiting` | boolean，`true` | 需要你回复时通知 |
 | `notifyBackgroundOnly` | boolean，`true` | 仅当窗口不在最前时通知 |
-| `notifyCompletionBody` | string，`''` | 完成通知正文；留空用内置文案 |
-| `notifyWaitingBody` | string，`''` | 回复通知正文；留空用内置文案 |
+| `notifyCompletionBody` | string，`''` | 完成通知正文；留空用内置文案（两种情况下状态图标都会自动加在最前） |
+| `notifyWaitingBody` | string，`''` | 回复通知正文；留空用内置文案（两种情况下状态图标都会自动加在最前） |
 
 8 种内置音色：`chime-up`（清脆上行）、`chime-down`（柔和下行）、`bell`（铃音）、`ping`（单声
 提示）、`double`（双声提示）、`triple`（三连音）、`ask-up`（轻快上行）、`ask-down`（轻快下行）。
@@ -156,9 +174,11 @@ npm test        # node tests/smoke.mjs && node tests/host.mjs
 ```
 
 `tests/smoke.mjs` 在桩化的浏览器全局对象与桩化的 Cordis 上下文里运行 `lib/client.js`，然后驱动
-会话状态 observable：设置分组注册成功、控件能写入、两个提示音都会响、不该响的情况保持安静。
-`tests/host.mjs` 在桩化的 Host 上下文里运行 `lib/index.js`：命名空间注册成功、entry Config 能
-到达页面。不需要浏览器、不需要密钥、不需要构建；CI 会在 Linux、Windows、macOS 上分别跑一遍。
+会话状态与会话列表 observable：设置分组注册成功、控件能写入、两个按侧边栏状态点的提醒都会响、不该
+响的情况保持安静 —— 包括子 agent 或 teammate 结束、没有目录行的会话、还有子会话在跑的父会话、
+以及被取消的一轮。`tests/host.mjs` 在桩化的 Host 上下文里运行 `lib/index.js`：命名空间注册成功、
+entry Config 能到达页面。不需要浏览器、不需要密钥、不需要构建；CI 会在 Linux、Windows、macOS 上
+分别跑一遍。
 
 ### 目录结构
 
@@ -193,6 +213,9 @@ tests/host.mjs       Host 部分的无密钥测试
   在普通浏览器里，第一次开启或点测试按钮会触发浏览器授权弹窗，被拒绝时页面会显示提示。
 - 默认只在窗口不在最前时弹通知，免得打断正在看屏幕的你。
 - 该 profile 下每个打开的页面都会提醒；触发是按 profile 的，不是按窗口的。
+- 插件读的状态点就是侧边栏自己的推导，只是抄进插件里：插件不会改变侧边栏的显示，两处刻意的差异是
+  正在看的会话完成时照响（侧边栏会清掉你正在读的那个会话自己的完成提醒），以及被取消的一轮保持
+  安静（侧边栏此时仍可能显示绿点）。
 - 自定义音频整个存在设置值里，请控制在通知长度的片段内；过大的文件会被拒绝并给出提示。
 - 内置音色是 Web Audio 振荡器生成的，不会从网络拉取任何东西。
 - 完成提醒的防抖是 Config 字段（`completionDelayMs`，默认 1200 ms，`0` 关闭）。它不在设置页面上

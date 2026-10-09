@@ -97,10 +97,13 @@ let values = {
 }
 let statusMap = new Map()
 const statusListeners = new Set()
+const listListeners = new Set()
 const scopeListeners = new Set()
 const effects = []
 const sections = []
 let localized = ''
+/** Dictionaries the bundle registered, for the copy assertions below. */
+let registered
 
 const scope = {
   getSnapshot: () => ({ status: 'ready', value: { ...values }, revision: 1, writable: true, mode: 'host' }),
@@ -134,11 +137,39 @@ const closedTurn = (reason) => {
 }
 
 const sessionRows = {}
+/** Durable event windows this browser holds, keyed by session. */
+const bindings = {}
+/** Subagent catalogs (direct children) keyed by parent session. */
+const projections = {}
+/** Session-list arrival lifecycle: `pending` while the list RPC is in flight. */
+let listPhase = 'ready'
+
+// Only a known top-level session row can own a sidebar status dot, so the
+// session under test needs one before anything may alert for it.
+sessionRows.s1 = { displayTitle: '重构登录流程', running: true, blank: false, updatedAt: 1 }
+/** Push one session-status snapshot into the subscribed plugin. */
+const pushStatus = (next) => {
+  statusMap = next
+  for (const listener of statusListeners) listener()
+}
+/** Push one session-list update into the subscribed plugin. */
+const pushRows = () => {
+  for (const listener of listListeners) listener()
+}
+/**
+ * One pending interaction in the shape the client publishes: `key` identifies
+ * the interaction and `kind` is the sidebar's pending kind. Only `approval`,
+ * `plan-review` and `question` turn the sidebar row yellow.
+ */
+const pending = (key, kind = 'question') => ({ key, kind })
 const services = {
   settingsScope: { bind: (spec) => { assert.equal(spec.namespace, 'voice-alert'); return scope } },
   sessions: {
-    list: { getSnapshot: () => ({ byId: sessionRows }) },
-    binding: (id) => (id === 's1' ? { eventSource: { getSnapshot: () => ({ entries: turnEntries }) } } : undefined),
+    list: {
+      getSnapshot: () => ({ byId: sessionRows, projectionsBySession: projections, phase: listPhase }),
+      subscribe: (listener) => { listListeners.add(listener); return () => { listListeners.delete(listener) } },
+    },
+    binding: (id) => bindings[id],
   },
   uiSession: {
     sessionStatus: {
@@ -163,6 +194,7 @@ const ctx = {
       assert.equal(ns, 'settings.voiceAlert')
       assert.deepEqual(Object.keys(dictionaries).sort(), ['en', 'zh'])
       assert.deepEqual(Object.keys(dictionaries.zh).sort(), Object.keys(dictionaries.en).sort())
+      registered = dictionaries
       return () => {}
     },
     bind: () => (key, params) => {
@@ -172,12 +204,14 @@ const ctx = {
   },
 }
 
-moduleExports.apply(ctx)
-
-const push = (next) => {
-  statusMap = next
-  for (const listener of statusListeners) listener()
+/** The event window of the session under test; other sessions have none. */
+const windowSource = {
+  getSnapshot: () => ({ entries: turnEntries }),
+  subscribe: () => () => {},
 }
+bindings.s1 = { eventSource: windowSource }
+
+moduleExports.apply(ctx)
 
 // --------------------------------------------------------------- registration
 
@@ -188,6 +222,18 @@ assert.equal(typeof sections[0].options.label, 'function')
 assert.equal(sections[0].options.label(), 'nav', 'nav label resolves through the locale binding')
 assert.equal(styleTags.length, 1, 'stylesheet injected once')
 assert.ok(scopeListeners.size > 0, 'the settings scope is observed')
+
+// The alert titles come from the session row, so the per-event title copy is
+// dead and must not come back; the test button still needs the completion pair.
+for (const [language, dictionary] of Object.entries(registered)) {
+  assert.ok(!Object.hasOwn(dictionary, 'notify.waitingTitle'),
+    `${language} carries no dead reply title`)
+  assert.ok(!Object.hasOwn(dictionary, 'notify.errorTitle') && !Object.hasOwn(dictionary, 'notify.errorBody'),
+    `${language} carries no error copy`)
+  assert.ok(Object.hasOwn(dictionary, 'notify.completionTitle') && Object.hasOwn(dictionary, 'notify.completionBody'),
+    `${language} keeps the copy the test notification uses`)
+  assert.ok(Object.hasOwn(dictionary, 'notify.waitingBody'), `${language} keeps the default reply body`)
+}
 
 // -------------------------------------------------------------- section render
 
@@ -233,92 +279,113 @@ assert.ok(writes.some(([field]) => field === 'completionTone'), 'tone selection 
 // ------------------------------------------------------------------ the sounds
 
 tonePlays.length = 0
-push(new Map([['s1', { running: true, pendingInteraction: undefined }]]))
+pushStatus(new Map([['s1', { running: true, pendingInteraction: undefined }]]))
 assert.equal(tonePlays.length, 0, 'the first status establishes a baseline silently')
 
-push(new Map([['s1', { running: true, pendingInteraction: { key: 'question:1' } }]]))
+pushStatus(new Map([['s1', { running: true, pendingInteraction: pending('question:1') }]]))
 assert.ok(tonePlays.length > 0, 'a pending question plays the waiting sound')
 
 tonePlays.length = 0
-push(new Map([['s1', { running: true, pendingInteraction: undefined }]]))
+pushStatus(new Map([['s1', { running: true, pendingInteraction: undefined }]]))
 assert.equal(tonePlays.length, 0, 'answering leaves running state alone')
 
-push(new Map([['s1', { running: false, pendingInteraction: undefined }]]))
+pushStatus(new Map([['s1', { running: false, pendingInteraction: undefined }]]))
 assert.ok(tonePlays.length > 0, 'a finished turn plays the completion sound')
 
 tonePlays.length = 0
 values = { ...values, enabled: false }
-push(new Map([['s1', { running: true, pendingInteraction: undefined }]]))
-push(new Map([['s1', { running: false, pendingInteraction: undefined }]]))
+pushStatus(new Map([['s1', { running: true, pendingInteraction: undefined }]]))
+pushStatus(new Map([['s1', { running: false, pendingInteraction: undefined }]]))
 assert.equal(tonePlays.length, 0, 'the master switch silences both sounds')
 
 values = { ...values, enabled: true, waitingEnabled: false, completionEnabled: false }
-push(new Map([['s1', { running: true, pendingInteraction: undefined }]]))
-push(new Map([['s1', { running: false, pendingInteraction: { key: 'approval:1' } }]]))
+pushStatus(new Map([['s1', { running: true, pendingInteraction: undefined }]]))
+pushStatus(new Map([['s1', { running: false, pendingInteraction: pending('approval:1') }]]))
 assert.equal(tonePlays.length, 0, 'per-event switches silence each sound')
 
 values = { ...values, waitingEnabled: true, completionEnabled: true }
 tonePlays.length = 0
-push(new Map([['s1', { running: false, pendingInteraction: undefined }]]))
-push(new Map([['s1', { running: false, pendingInteraction: { key: 'approval:1' } }]]))
+pushStatus(new Map([['s1', { running: false, pendingInteraction: undefined }]]))
+pushStatus(new Map([['s1', { running: false, pendingInteraction: pending('approval:1') }]]))
 assert.ok(tonePlays.length > 0, 'a pending approval plays the waiting sound')
 
 // ------------------------------------------------- system notifications
 
 notifications.length = 0
 values = { ...values, notifyEnabled: true, notifyCompletion: true, notifyWaiting: true, notifyBackgroundOnly: false }
-push(new Map([['s1', { running: true, pendingInteraction: undefined }]]))
-push(new Map([['s1', { running: false, pendingInteraction: undefined }]]))
+pushStatus(new Map([['s1', { running: true, pendingInteraction: undefined }]]))
+pushStatus(new Map([['s1', { running: false, pendingInteraction: undefined }]]))
 assert.equal(notifications.length, 1, 'a finished turn raises a system notification')
-assert.equal(notifications[0].title, 'notify.completionTitle', 'the title comes from the dictionary')
-assert.equal(notifications[0].options.body, '帮我把登录流程重构一下，顺便补上测试',
-  'the body is the prompt the user sent for that turn, not the session title')
+assert.equal(notifications[0].title, '重构登录流程', 'the title is the session display title')
+assert.equal(notifications[0].options.body, '🐳 帮我把登录流程重构一下，顺便补上测试',
+  'the body is the completion icon plus the prompt the user sent, not the session title')
 assert.equal(notifications[0].options.silent, true, 'the OS sound stays off while this plugin plays one')
+
+// Re-reaching the same finished state is not a new turn: one episode, one alert.
+pushStatus(new Map([['s1', { running: false, pendingInteraction: undefined }]]))
+assert.equal(notifications.length, 1, 'a repeated evaluation does not repeat the completion alert')
 
 // The opt-in default is off, so nothing is raised until the user turns it on.
 values = { ...values, notifyEnabled: false }
 notifications.length = 0
-push(new Map([['s1', { running: true, pendingInteraction: undefined }]]))
-push(new Map([['s1', { running: false, pendingInteraction: undefined }]]))
+pushStatus(new Map([['s1', { running: true, pendingInteraction: undefined }]]))
+pushStatus(new Map([['s1', { running: false, pendingInteraction: undefined }]]))
 assert.equal(notifications.length, 0, 'notifications are opt-in')
 
 // A body override wins over the built-in text.
 values = { ...values, notifyEnabled: true, notifyCompletionBody: '部署完成了' }
 notifications.length = 0
-push(new Map([['s1', { running: true, pendingInteraction: undefined }]]))
-push(new Map([['s1', { running: false, pendingInteraction: undefined }]]))
-assert.equal(notifications[0].options.body, '部署完成了', 'the text override replaces the default body')
+pushStatus(new Map([['s1', { running: true, pendingInteraction: undefined }]]))
+pushStatus(new Map([['s1', { running: false, pendingInteraction: undefined }]]))
+assert.equal(notifications[0].options.body, '🐳 部署完成了',
+  'a completion override keeps the completion icon in front of it')
 
 // The window-in-front rule suppresses the toast but not the event itself.
 values = { ...values, notifyCompletionBody: '', notifyBackgroundOnly: true }
 notifications.length = 0
 documentFocused = true
-push(new Map([['s1', { running: true, pendingInteraction: undefined }]]))
-push(new Map([['s1', { running: false, pendingInteraction: undefined }]]))
+pushStatus(new Map([['s1', { running: true, pendingInteraction: undefined }]]))
+pushStatus(new Map([['s1', { running: false, pendingInteraction: undefined }]]))
 assert.equal(notifications.length, 0, 'an in-focus window is not toasted')
 documentFocused = false
-push(new Map([['s1', { running: true, pendingInteraction: undefined }]]))
-push(new Map([['s1', { running: false, pendingInteraction: undefined }]]))
+pushStatus(new Map([['s1', { running: true, pendingInteraction: undefined }]]))
+pushStatus(new Map([['s1', { running: false, pendingInteraction: undefined }]]))
 assert.equal(notifications.length, 1, 'a window behind another app is toasted')
 
 // A pending question notifies with its own title, and the reply switch gates it.
 notifications.length = 0
 values = { ...values, notifyBackgroundOnly: false }
-push(new Map([['s1', { running: false, pendingInteraction: undefined }]]))
-push(new Map([['s1', { running: false, pendingInteraction: { key: 'q:1' } }]]))
+pushStatus(new Map([['s1', { running: false, pendingInteraction: undefined }]]))
+pushStatus(new Map([['s1', { running: false, pendingInteraction: pending('q:1') }]]))
 assert.equal(notifications.length, 1, 'a pending question raises a notification')
-assert.equal(notifications[0].title, 'notify.waitingTitle')
+assert.equal(notifications[0].title, '重构登录流程', 'a reply alert carries the session title too')
+assert.equal(notifications[0].options.body, '❗ 帮我把登录流程重构一下，顺便补上测试',
+  'a reply alert opens with the attention icon and keeps the prompt precedence')
+
+// The same pending interaction re-published is not a new request for a reply.
+pushStatus(new Map([['s1', { running: false, pendingInteraction: pending('q:1') }]]))
+assert.equal(notifications.length, 1, 'the same pending key does not notify twice')
+
+// A reply body override keeps the attention icon in front of it too.
+values = { ...values, notifyWaitingBody: '等你拍板' }
+notifications.length = 0
+pushStatus(new Map([['s1', { running: false, pendingInteraction: undefined }]]))
+pushStatus(new Map([['s1', { running: false, pendingInteraction: pending('q:1b') }]]))
+assert.equal(notifications[0].options.body, '❗ 等你拍板',
+  'a reply override keeps the attention icon in front of it')
+values = { ...values, notifyWaitingBody: '' }
+
 values = { ...values, notifyWaiting: false }
 notifications.length = 0
-push(new Map([['s1', { running: false, pendingInteraction: undefined }]]))
-push(new Map([['s1', { running: false, pendingInteraction: { key: 'q:2' } }]]))
+pushStatus(new Map([['s1', { running: false, pendingInteraction: undefined }]]))
+pushStatus(new Map([['s1', { running: false, pendingInteraction: pending('q:2') }]]))
 assert.equal(notifications.length, 0, 'the reply-notification switch silences it')
 
 // With the plugin's own sound off, the toast is allowed to carry the OS sound.
 values = { ...values, enabled: false, notifyWaiting: true }
 notifications.length = 0
-push(new Map([['s1', { running: false, pendingInteraction: undefined }]]))
-push(new Map([['s1', { running: false, pendingInteraction: { key: 'q:3' } }]]))
+pushStatus(new Map([['s1', { running: false, pendingInteraction: undefined }]]))
+pushStatus(new Map([['s1', { running: false, pendingInteraction: pending('q:3') }]]))
 assert.equal(notifications[0].options.silent, false, 'the OS sound is left on when this plugin plays nothing')
 values = { ...values, enabled: true }
 
@@ -328,25 +395,24 @@ const notificationFace = sections[0].options.inject({ sync: () => {} })
 assert.equal(notificationFace.notificationPermission(), 'granted')
 assert.equal(notificationFace.testNotification(), true, 'the test button reports a raised notification')
 assert.equal(notifications.length, 1, 'the test button raises one notification')
+assert.equal(notifications[0].options.body, 'notify.completionBody',
+  'the test button is not an alert, so its body carries no status icon')
+assert.equal(notifications[0].title, 'notify.completionTitle', 'the test button keeps its dictionary title')
 
 // The prompt the user sent for that turn outranks the session title.
-sessionRows.s1 = { displayTitle: '重构登录流程' }
 notifications.length = 0
 values = { ...values, notifyEnabled: true, notifyBackgroundOnly: false, notifyCompletionBody: '' }
-push(new Map([['s1', { running: true, pendingInteraction: undefined }]]))
-push(new Map([['s1', { running: false, pendingInteraction: undefined }]]))
-assert.equal(notifications[0].options.body, '帮我把登录流程重构一下，顺便补上测试',
+pushStatus(new Map([['s1', { running: true, pendingInteraction: undefined }]]))
+pushStatus(new Map([['s1', { running: false, pendingInteraction: undefined }]]))
+assert.equal(notifications[0].options.body, '🐳 帮我把登录流程重构一下，顺便补上测试',
   'the latest prompt outranks the session title')
-delete sessionRows.s1
 
 // An explicit override still outranks both.
-sessionRows.s1 = { displayTitle: '重构登录流程' }
 notifications.length = 0
 values = { ...values, notifyCompletionBody: '搞定了' }
-push(new Map([['s1', { running: true, pendingInteraction: undefined }]]))
-push(new Map([['s1', { running: false, pendingInteraction: undefined }]]))
-assert.equal(notifications[0].options.body, '搞定了', 'the user override outranks the prompt')
-delete sessionRows.s1
+pushStatus(new Map([['s1', { running: true, pendingInteraction: undefined }]]))
+pushStatus(new Map([['s1', { running: false, pendingInteraction: undefined }]]))
+assert.equal(notifications[0].options.body, '🐳 搞定了', 'the user override outranks the prompt')
 values = { ...values, notifyCompletionBody: '' }
 
 // ---------------------------------------------------- what must NOT alert
@@ -357,8 +423,8 @@ const sleep = (ms) => new Promise((resolve) => { setTimeout(resolve, ms) })
 closedTurn({ kind: 'aborted', reason: { kind: 'user' } })
 tonePlays.length = 0
 notifications.length = 0
-push(new Map([['s1', { running: true, pendingInteraction: undefined }]]))
-push(new Map([['s1', { running: false, pendingInteraction: undefined }]]))
+pushStatus(new Map([['s1', { running: true, pendingInteraction: undefined }]]))
+pushStatus(new Map([['s1', { running: false, pendingInteraction: undefined }]]))
 assert.equal(tonePlays.length, 0, 'a cancelled turn plays nothing')
 assert.equal(notifications.length, 0, 'a cancelled turn notifies nothing')
 
@@ -371,66 +437,89 @@ for (const reason of [
 ]) {
   closedTurn(reason)
   tonePlays.length = 0
-  push(new Map([['s1', { running: true, pendingInteraction: undefined }]]))
-  push(new Map([['s1', { running: false, pendingInteraction: undefined }]]))
+  pushStatus(new Map([['s1', { running: true, pendingInteraction: undefined }]]))
+  pushStatus(new Map([['s1', { running: false, pendingInteraction: undefined }]]))
   assert.equal(tonePlays.length, 0, `${reason.kind} stays silent`)
 }
 
 // A newer turn still open means the work continues: no "finished" alert.
 turnEntries = [{ type: 'event', event: { type: 'turn/start', data: { turn: 2 } } }]
 tonePlays.length = 0
-push(new Map([['s1', { running: true, pendingInteraction: undefined }]]))
-push(new Map([['s1', { running: false, pendingInteraction: undefined }]]))
+pushStatus(new Map([['s1', { running: true, pendingInteraction: undefined }]]))
+pushStatus(new Map([['s1', { running: false, pendingInteraction: undefined }]]))
 assert.equal(tonePlays.length, 0, 'a turn that is still open does not alert')
 
 // Internal runs (subagents, teammates) end constantly, so they never alert.
-sessionRows.s2 = { displayTitle: '研究子代理', origin: 'subagent' }
+sessionRows.s2 = { displayTitle: '研究子代理', origin: 'subagent', running: true, blank: false, updatedAt: 2 }
 tonePlays.length = 0
 notifications.length = 0
 values = { ...values, notifyEnabled: true, notifyBackgroundOnly: false, notifyWaiting: true }
-push(new Map([
+pushStatus(new Map([
   ['s2', { running: true, pendingInteraction: undefined }],
   ['s1', { running: false, pendingInteraction: undefined }],
 ]))
-push(new Map([
+pushStatus(new Map([
   ['s2', { running: false, pendingInteraction: undefined }],
   ['s1', { running: false, pendingInteraction: undefined }],
 ]))
 assert.equal(tonePlays.length, 0, 'a subagent finishing alerts nothing')
-push(new Map([
-  ['s2', { running: false, pendingInteraction: { key: 'sub:1' } }],
+pushStatus(new Map([
+  ['s2', { running: false, pendingInteraction: pending('sub:1') }],
   ['s1', { running: false, pendingInteraction: undefined }],
 ]))
 assert.equal(notifications.length, 0, 'a subagent question alerts nothing')
 delete sessionRows.s2
 
-// A failed turn alerts as a failure, with the error text as the body.
+// A failed turn is the completion trigger, not a third one: same switch, same
+// session title, and only the body source differs.
 values = { ...values, notifyEnabled: true }
 closedTurn({ kind: 'error', error: { message: 'ENOSPC: no space left on device', code: 'UNKNOWN' } })
 tonePlays.length = 0
 notifications.length = 0
-push(new Map([['s1', { running: true, pendingInteraction: undefined }]]))
-push(new Map([['s1', { running: false, pendingInteraction: undefined }]]))
+pushStatus(new Map([['s1', { running: true, pendingInteraction: undefined }]]))
+pushStatus(new Map([['s1', { running: false, pendingInteraction: undefined }]]))
 assert.ok(tonePlays.length > 0, 'a failed turn still calls you back')
-assert.equal(notifications[0].title, 'notify.errorTitle', 'a failed turn is not labelled a completion')
+assert.equal(notifications.length, 1, 'a failed turn raises one notification')
+assert.equal(notifications[0].title, '重构登录流程', 'a failed turn carries the session title, not an error title')
+assert.ok(notifications[0].options.body.startsWith('🌀 '),
+  'a failed turn opens with the failure icon')
 assert.ok(notifications[0].options.body.includes('ENOSPC'), 'the failure text becomes the body')
+
+// An error reason without a message falls back to the prompt like any other end.
+closedTurn({ kind: 'error' })
+tonePlays.length = 0
+notifications.length = 0
+pushStatus(new Map([['s1', { running: true, pendingInteraction: undefined }]]))
+pushStatus(new Map([['s1', { running: false, pendingInteraction: undefined }]]))
+assert.equal(notifications[0].options.body, '🌀 帮我把登录流程重构一下，顺便补上测试',
+  'an error without a message keeps the failure icon and uses the prompt')
+
+// A completion override on a failed turn still opens with the failure icon.
+values = { ...values, notifyCompletionBody: '这轮炸了' }
+tonePlays.length = 0
+notifications.length = 0
+pushStatus(new Map([['s1', { running: true, pendingInteraction: undefined }]]))
+pushStatus(new Map([['s1', { running: false, pendingInteraction: undefined }]]))
+assert.equal(notifications[0].options.body, '🌀 这轮炸了',
+  'a failure override keeps the failure icon in front of it')
+values = { ...values, notifyCompletionBody: '' }
 
 // ------------------------------------------------------ the debounce itself
 
 closedTurn({ kind: 'completed' })
 values = { ...values, completionDelayMs: 60, notifyEnabled: false }
 tonePlays.length = 0
-push(new Map([['s1', { running: true, pendingInteraction: undefined }]]))
-push(new Map([['s1', { running: false, pendingInteraction: undefined }]]))
+pushStatus(new Map([['s1', { running: true, pendingInteraction: undefined }]]))
+pushStatus(new Map([['s1', { running: false, pendingInteraction: undefined }]]))
 assert.equal(tonePlays.length, 0, 'the completion alert waits out the delay')
 await sleep(140)
 assert.ok(tonePlays.length > 0, 'a turn that stays stopped alerts after the delay')
 
 // A turn that resumes inside the delay reports nothing at all.
 tonePlays.length = 0
-push(new Map([['s1', { running: true, pendingInteraction: undefined }]]))
-push(new Map([['s1', { running: false, pendingInteraction: undefined }]]))
-push(new Map([['s1', { running: true, pendingInteraction: undefined }]]))
+pushStatus(new Map([['s1', { running: true, pendingInteraction: undefined }]]))
+pushStatus(new Map([['s1', { running: false, pendingInteraction: undefined }]]))
+pushStatus(new Map([['s1', { running: true, pendingInteraction: undefined }]]))
 await sleep(140)
 assert.equal(tonePlays.length, 0, 'a resumed turn never reported the intermediate pause')
 
@@ -440,7 +529,7 @@ turnEntries = [
   { type: 'event', event: { type: 'turn/start', data: { turn: 1 } } },
   { type: 'event', event: { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } } },
 ]
-push(new Map([['s1', { running: false, pendingInteraction: undefined }]]))
+pushStatus(new Map([['s1', { running: false, pendingInteraction: undefined }]]))
 
 // ------------------------------- the body names the turn the user asked for
 
@@ -453,21 +542,23 @@ turnEntries = [
   userMessage('<system-reminder>Additional instructions from: AGENTS.md</system-reminder>', 'agent-instructions'),
 ]
 notifications.length = 0
-push(new Map([['s1', { running: true, pendingInteraction: undefined }]]))
-push(new Map([['s1', { running: false, pendingInteraction: undefined }]]))
-assert.equal(notifications[0].options.body, '把登录页的错误提示统一一下',
+pushStatus(new Map([['s1', { running: true, pendingInteraction: undefined }]]))
+pushStatus(new Map([['s1', { running: false, pendingInteraction: undefined }]]))
+assert.equal(notifications[0].options.body, '🐳 把登录页的错误提示统一一下',
   'injected context never becomes the body')
 
-// The session title remains the fallback for a log with no user prompt at all.
-sessionRows.s1 = { displayTitle: '重构登录流程' }
+// Without a user prompt the body falls back to the built-in copy, never to the
+// session title: the title is the notification's title and nothing else.
 turnEntries = [
   { type: 'event', event: { type: 'turn/start', data: { turn: 1 } } },
   { type: 'event', event: { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } } },
 ]
 notifications.length = 0
-push(new Map([['s1', { running: true, pendingInteraction: undefined }]]))
-push(new Map([['s1', { running: false, pendingInteraction: undefined }]]))
-assert.equal(notifications[0].options.body, '重构登录流程', 'the session title is the fallback body')
+pushStatus(new Map([['s1', { running: true, pendingInteraction: undefined }]]))
+pushStatus(new Map([['s1', { running: false, pendingInteraction: undefined }]]))
+assert.equal(notifications[0].title, '重构登录流程', 'the title stays the session display title')
+assert.equal(notifications[0].options.body, '🐳 notify.completionBody',
+  'a log without a user prompt falls back to the default body, still behind the icon')
 
 // A multi-line prompt collapses to one bounded line.
 turnEntries = [
@@ -476,12 +567,312 @@ turnEntries = [
   { type: 'event', event: { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } } },
 ]
 notifications.length = 0
-push(new Map([['s1', { running: true, pendingInteraction: undefined }]]))
-push(new Map([['s1', { running: false, pendingInteraction: undefined }]]))
+pushStatus(new Map([['s1', { running: true, pendingInteraction: undefined }]]))
+pushStatus(new Map([['s1', { running: false, pendingInteraction: undefined }]]))
 const collapsed = notifications[0].options.body
-assert.ok(collapsed.startsWith('第一行 第二行'), 'a multi-line prompt collapses into one line')
-assert.ok(collapsed.length <= 120, 'the body is bounded')
+assert.ok(collapsed.startsWith('🐳 第一行 第二行'), 'a multi-line prompt collapses into one line behind the icon')
+assert.ok(collapsed.length <= 123, 'the body is the icon plus a prompt bounded to 120')
+
+// ------------------------------------------ what the sidebar can and cannot see
+
+// A row this browser has not loaded owns no sidebar dot, so it must stay silent
+// even when the turn ends: the row check fails closed, not open.
+turnEntries = [
+  { type: 'event', event: { type: 'turn/start', data: { turn: 1 } } },
+  { type: 'event', event: { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } } },
+]
 delete sessionRows.s1
+tonePlays.length = 0
+notifications.length = 0
+pushStatus(new Map([['s1', { running: true, pendingInteraction: undefined }]]))
+pushStatus(new Map([['s1', { running: false, pendingInteraction: undefined }]]))
+await sleep(20)
+assert.equal(tonePlays.length, 0, 'a session without a catalog row plays nothing')
+assert.equal(notifications.length, 0, 'a session without a catalog row notifies nothing')
+
+// A background session has no event window here at all: leaving it retires the
+// binding, so the window cannot be what proves the turn ended. The status
+// signal carries it and the alert still fires.
+sessionRows.s1 = { displayTitle: '重构登录流程', running: true, blank: false, updatedAt: 1 }
+delete bindings.s1
+pushStatus(new Map([['s1', { running: true, pendingInteraction: undefined }]]))
+tonePlays.length = 0
+notifications.length = 0
+pushStatus(new Map([['s1', { running: false, pendingInteraction: undefined }]]))
+await sleep(20)
+assert.ok(tonePlays.length > 0, 'a windowless session still plays the completion sound')
+assert.equal(notifications.length, 1, 'a windowless session still raises a notification')
+assert.equal(notifications[0].options.body, '🐳 notify.completionBody',
+  'without a window the body falls back to the default text, still behind the icon')
+
+// A reply that is needed needs no window either.
+notifications.length = 0
+pushStatus(new Map([['s1', { running: false, pendingInteraction: undefined }]]))
+pushStatus(new Map([['s1', { running: false, pendingInteraction: pending('q:9') }]]))
+assert.equal(notifications.length, 1, 'a windowless session still raises the reply notification')
+pushStatus(new Map([['s1', { running: false, pendingInteraction: undefined }]]))
+
+// Back to a readable window for the cases that need one.
+bindings.s1 = { eventSource: windowSource }
+turnEntries = [
+  userMessage('帮我把登录流程重构一下，顺便补上测试'),
+  { type: 'event', event: { type: 'turn/start', data: { turn: 1 } } },
+  { type: 'event', event: { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } } },
+]
+
+// A teammate session is a subagent child: its own end and its own question are
+// never sidebar dots, and it owns no trigger even while its row is loaded.
+sessionRows.child = { displayTitle: 'teammate', parentId: 's1', running: true, blank: false, updatedAt: 2 }
+tonePlays.length = 0
+notifications.length = 0
+pushStatus(new Map([
+  ['child', { running: true, pendingInteraction: undefined }],
+  ['s1', { running: true, pendingInteraction: undefined }],
+]))
+pushStatus(new Map([
+  ['child', { running: false, pendingInteraction: undefined }],
+  ['s1', { running: true, pendingInteraction: undefined }],
+]))
+await sleep(20)
+assert.equal(tonePlays.length, 0, 'a teammate session finishing alerts nothing')
+pushStatus(new Map([
+  ['child', { running: false, pendingInteraction: pending('child:1') }],
+  ['s1', { running: true, pendingInteraction: undefined }],
+]))
+assert.equal(notifications.length, 0, 'a teammate session question alerts nothing')
+delete sessionRows.child
+
+// The parent stops first while a child still runs: the sidebar row spins, so no
+// completion alert. The last child stopping is the moment the row turns green,
+// and it alerts exactly once.
+projections.s1 = { values: { subagentCatalog: [{ id: 'child', createdAt: 0, mode: 'one-shot' }] } }
+sessionRows.child = { displayTitle: 'teammate', parentId: 's1', running: true, blank: false, updatedAt: 2 }
+tonePlays.length = 0
+notifications.length = 0
+pushStatus(new Map([
+  ['child', { running: true, pendingInteraction: undefined }],
+  ['s1', { running: true, pendingInteraction: undefined }],
+]))
+pushStatus(new Map([
+  ['child', { running: true, pendingInteraction: undefined }],
+  ['s1', { running: false, pendingInteraction: undefined }],
+]))
+await sleep(20)
+assert.equal(tonePlays.length, 0, 'a parent with a running child does not alert when it stops')
+assert.equal(notifications.length, 0, 'a parent with a running child notifies nothing')
+
+pushStatus(new Map([
+  ['child', { running: false, pendingInteraction: undefined }],
+  ['s1', { running: false, pendingInteraction: undefined }],
+]))
+await sleep(20)
+assert.equal(notifications.length, 1, 'the last child stopping is the moment the row turns green')
+
+pushStatus(new Map([
+  ['child', { running: false, pendingInteraction: undefined }],
+  ['s1', { running: false, pendingInteraction: undefined }],
+]))
+await sleep(20)
+assert.equal(notifications.length, 1, 'that completion alerts exactly once')
+delete projections.s1
+delete sessionRows.child
+
+// The child row alone says it runs, with no status entry: the catalog fallback
+// still counts it, so the parent stays in the spinning state.
+turnEntries = [
+  { type: 'event', event: { type: 'turn/start', data: { turn: 1 } } },
+  { type: 'event', event: { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } } },
+]
+projections.s1 = { values: { subagentCatalog: [{ id: 'child', createdAt: 0, mode: 'one-shot' }] } }
+sessionRows.child = { displayTitle: 'teammate', parentId: 's1', running: true, blank: false, updatedAt: 2 }
+notifications.length = 0
+pushStatus(new Map([['s1', { running: true, pendingInteraction: undefined }]]))
+pushStatus(new Map([['s1', { running: false, pendingInteraction: undefined }]]))
+await sleep(20)
+assert.equal(notifications.length, 0, 'a child row still marked running suppresses the parent alert')
+sessionRows.child.running = false
+pushRows()
+await sleep(20)
+assert.equal(notifications.length, 1, 'the child row stopping releases the parent alert')
+delete projections.s1
+delete sessionRows.child
+
+// A session on screen is still worth alerting for: the sidebar shows its dot
+// whether or not it is the one you are looking at.
+sessionRows.s1 = { displayTitle: '重构登录流程', running: true, blank: false, updatedAt: 1 }
+turnEntries = [
+  userMessage('帮我把登录流程重构一下，顺便补上测试'),
+  { type: 'event', event: { type: 'turn/start', data: { turn: 1 } } },
+  { type: 'event', event: { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } } },
+]
+notifications.length = 0
+pushStatus(new Map([['s1', { running: true, pendingInteraction: undefined }]]))
+pushStatus(new Map([['s1', { running: false, pendingInteraction: undefined }]]))
+assert.equal(notifications.length, 1, 'the session in the main view still alerts when it finishes')
+assert.equal(notifications[0].options.body, '🐳 帮我把登录流程重构一下，顺便补上测试',
+  'its body is still the prompt the user sent, behind the completion icon')
+
+// ------------------------------------------------ boot races and unknown kinds
+
+// A plugin that initialized before the session list landed must not read the
+// rows arriving later as sessions that just stopped: a session that finished
+// before this page opened is idle in the sidebar, not a completion.
+delete sessionRows.s1
+sessionRows.s0 = { displayTitle: '别的会话', running: true, blank: false, updatedAt: 1 }
+tonePlays.length = 0
+notifications.length = 0
+pushStatus(new Map([['s0', { running: true, pendingInteraction: undefined }]]))
+sessionRows.dead = { displayTitle: '上个月就完成的', running: false, blank: false, updatedAt: 5 }
+pushStatus(new Map([
+  ['s0', { running: true, pendingInteraction: undefined }],
+  ['dead', { running: false, pendingInteraction: undefined }],
+]))
+pushRows()
+await sleep(20)
+assert.equal(tonePlays.length, 0, 'a session that lands already stopped plays nothing')
+assert.equal(notifications.length, 0, 'a session that lands already stopped notifies nothing')
+
+// Later evaluation points must not report it either: one stop is one episode.
+pushStatus(new Map([
+  ['s0', { running: true, pendingInteraction: undefined }],
+  ['dead', { running: false, pendingInteraction: undefined }],
+]))
+pushRows()
+await sleep(20)
+assert.equal(notifications.length, 0, 'later evaluation points do not report it either')
+delete sessionRows.dead
+
+// While the list RPC is still in flight the plugin only builds a baseline.
+listPhase = 'pending'
+notifications.length = 0
+pushStatus(new Map([['s0', { running: true, pendingInteraction: undefined }]]))
+pushStatus(new Map([['s0', { running: false, pendingInteraction: undefined }]]))
+await sleep(20)
+assert.equal(notifications.length, 0, 'a stop during the pending list phase stays silent')
+listPhase = 'ready'
+
+// ...and the same transition is reported once the list is ready, so the
+// baseline guard must not silence the main scenario.
+pushStatus(new Map([['s0', { running: true, pendingInteraction: undefined }]]))
+pushStatus(new Map([['s0', { running: false, pendingInteraction: undefined }]]))
+await sleep(20)
+assert.equal(notifications.length, 1, 'a stop after the list is ready still alerts')
+delete sessionRows.s0
+
+// A pending interaction the sidebar does not turn yellow for is not a request
+// for a reply, and it must not hold back the completion alert either.
+sessionRows.s1 = { displayTitle: '重构登录流程', running: true, blank: false, updatedAt: 1 }
+bindings.s1 = { eventSource: windowSource }
+turnEntries = [
+  userMessage('帮我把登录流程重构一下，顺便补上测试'),
+  { type: 'event', event: { type: 'turn/start', data: { turn: 1 } } },
+  { type: 'event', event: { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } } },
+]
+notifications.length = 0
+pushStatus(new Map([['s1', { running: true, pendingInteraction: undefined }]]))
+pushStatus(new Map([['s1', { running: true, pendingInteraction: pending('wf:1', 'workflow-review') }]]))
+assert.equal(notifications.length, 0, 'a pending kind the sidebar ignores alerts nothing')
+pushStatus(new Map([['s1', { running: false, pendingInteraction: pending('wf:1', 'workflow-review') }]]))
+await sleep(20)
+assert.equal(notifications.length, 1, 'and it does not hold back the completion alert')
+pushStatus(new Map([['s1', { running: false, pendingInteraction: undefined }]]))
+
+// Two sessions stopping in the same evaluation point: the newest one reports at
+// once, and the other is deferred to its own debounce rather than dropped.
+sessionRows.a = { displayTitle: 'A', running: true, blank: false, updatedAt: 1 }
+sessionRows.b = { displayTitle: 'B', running: true, blank: false, updatedAt: 2 }
+notifications.length = 0
+pushStatus(new Map([
+  ['a', { running: true, pendingInteraction: undefined }],
+  ['b', { running: true, pendingInteraction: undefined }],
+]))
+pushStatus(new Map([
+  ['a', { running: false, pendingInteraction: undefined }],
+  ['b', { running: false, pendingInteraction: undefined }],
+]))
+assert.equal(notifications.length, 1, 'one evaluation point reports one completion')
+assert.equal(notifications[0].title, 'B', 'the newest row leads the tie-break')
+await sleep(20)
+assert.equal(notifications.length, 2, 'the losing candidate is deferred, not dropped')
+assert.equal(notifications[1].title, 'A', 'and it reports for its own session')
+delete sessionRows.a
+delete sessionRows.b
+
+// The newest-turn scan is reused while a session's window snapshot is
+// unchanged: an evaluation point must not rescan every long log it can see.
+// The row is watched running and then stopping, so the window is actually
+// consulted; its newest turn is open, so the completion is vetoed.
+let windowScans = 0
+const probeEntries = [{ type: 'event', event: { type: 'turn/start', data: { turn: 1 } } }]
+const countingEntries = {
+  [Symbol.iterator]: function* () { windowScans += 1; yield* probeEntries },
+}
+bindings.probe = {
+  eventSource: { getSnapshot: () => ({ entries: countingEntries }), subscribe: () => () => {} },
+}
+sessionRows.probe = { displayTitle: '探针', running: true, blank: false, updatedAt: 3 }
+const probeStatus = (running) => pushStatus(new Map([
+  ['probe', { running, pendingInteraction: undefined }],
+  ['s1', { running: true, pendingInteraction: undefined }],
+]))
+probeStatus(true)
+probeStatus(false)
+const firstScanCount = windowScans
+assert.equal(firstScanCount, 1, 'the first evaluation scans the window once')
+probeStatus(false)
+assert.equal(windowScans, firstScanCount, 'an unchanged window snapshot is not rescanned')
+delete sessionRows.probe
+delete bindings.probe
+
+// ------------------------------------------- the window never starts an alert
+
+// A session that ended before this plugin looked at it is idle here: no green
+// dot, no window. Opening it for the first time materializes its log, whose
+// last turn is a `turn/end` from before this page existed — that is not a
+// completion, so it must stay silent.
+turnEntries = [
+  userMessage('这是很久以前的提问'),
+  { type: 'event', event: { type: 'turn/start', data: { turn: 1 } } },
+  { type: 'event', event: { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } } },
+]
+sessionRows.idle = { displayTitle: '早就结束的会话', running: false, blank: false, updatedAt: 4 }
+tonePlays.length = 0
+notifications.length = 0
+pushStatus(new Map([
+  ['idle', { running: false, completionUnread: false, pendingInteraction: undefined }],
+]))
+assert.equal(notifications.length, 0, 'an idle row with no window alerts nothing')
+// First click: the session is retained and its durable log materializes.
+bindings.idle = { eventSource: windowSource }
+pushStatus(new Map([
+  ['idle', { running: false, completionUnread: false, pendingInteraction: undefined }],
+]))
+pushRows()
+await sleep(20)
+assert.equal(tonePlays.length, 0, 'materializing the log of an idle session plays nothing')
+assert.equal(notifications.length, 0, 'materializing the log of an idle session notifies nothing')
+delete sessionRows.idle
+delete bindings.idle
+
+// The status signal alone is enough when this browser never saw the session
+// run: an unread completion with no window still alerts (the window is not
+// required), and opening it afterwards must not report the same finish twice.
+sessionRows.bg = { displayTitle: '后台完成的会话', running: false, blank: false, updatedAt: 6 }
+notifications.length = 0
+pushStatus(new Map([
+  ['bg', { running: false, completionUnread: true, pendingInteraction: undefined }],
+]))
+assert.equal(notifications.length, 1, 'an unread completion with no window still alerts')
+assert.equal(notifications[0].title, '后台完成的会话', 'and it carries the session title')
+bindings.bg = { eventSource: windowSource }
+pushStatus(new Map([
+  ['bg', { running: false, completionUnread: false, pendingInteraction: undefined }],
+]))
+pushRows()
+await sleep(20)
+assert.equal(notifications.length, 1, 'opening the alerted session does not report it again')
+delete sessionRows.bg
+delete bindings.bg
 
 // ------------------------------------------------- a composition without them
 
@@ -526,4 +917,4 @@ assert.equal(synced.completionTone, 'ping', 'the browser mirror overrides the fi
 assert.equal(synced.volume, 0.9, 'untouched fields still come from the Host Config')
 delete globalThis.window.__DSH_VOICE_ALERT__
 
-console.log('smoke: ok — sections, writes, both alerts, and the no-alert cases behave')
+console.log('smoke: ok — sections, writes, both sidebar-dot alerts, and the no-alert cases behave')

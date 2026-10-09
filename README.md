@@ -4,46 +4,84 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 A [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) plugin: it plays one
-sound when a turn finishes, plays another when dsh is waiting for you to answer or choose,
-can raise a Windows/macOS system notification for either moment, and adds a **Sound alerts**
-(语音提醒) page to Settings where all of it is configured.
+sound when a session shows as finished in the sidebar, plays another when the sidebar shows
+that dsh needs you to answer or choose, can raise a Windows/macOS system notification for
+either moment, and adds a **Sound alerts** (语音提醒) page to Settings where all of it is
+configured.
 
 [中文说明 →](README.zh-CN.md)
 
 ## What it does
 
+Both alerts copy the sidebar's own status dots: the plugin derives each session row's dot
+from the same inputs the sidebar uses, so a sound means what the dot means.
+
 | Alert | Trigger | Default |
 |---|---|---|
-| Completion sound (`chime-up`) | a turn stopped and stayed stopped, and it did not stop because you cancelled it | on |
-| Reply-needed sound (`ask-up`) | a pending question or approval appears for a session | on |
+| Completion sound (`chime-up`) | a top-level session row shows the green dot: nothing is pending, the session is not running, no direct child is running, and its turn has ended | on |
+| Reply-needed sound (`ask-up`) | a top-level session row shows the yellow dot: a question, a plan review, or an approval is waiting for you | on |
 | System notification | the same two moments, as a Windows/macOS notification | off (opt-in) |
 
-Both moments come from the client's session-status snapshot (`uiSession.sessionStatus`),
-which folds `api-session/status` events with the composer's pending interactions. When a
-reply is needed and a turn ends in the same update, only the reply alert fires.
+A row can only show a dot if the sidebar draws it at all. A session this browser has no
+catalog row for — a teammate whose catalog was loaded by another window — is unknown, and an
+unknown row alerts for nothing. Nor does a session that is a subagent or carries a parent, an
+archived session, or a blank New Session row.
 
-A turn end is not the same as a finished task, so the completion alert is qualified two
-ways before it fires:
+The green dot is not "the turn ended", it is "the work stopped": a turn that starts again
+inside `completionDelayMs` (default 1200 ms) cancels its own alert, and a session that still
+has a direct child running keeps showing the spinning dot instead of the green one, so a
+parent that stops while its teammate works stays silent until the last child stops. That
+last child stopping is what turns the row green, and it alerts exactly once.
 
-- **It must stay stopped.** The alert waits `completionDelayMs` (default 1200 ms) after the
-  session goes idle. A turn that starts again inside that window — a goal round, an
-  auto-continuation, a tool loop resuming — cancels its own alert, so an intermediate pause
-  is never reported as a finished task.
-- **It must not be a cancellation.** The session's durable log says why the turn ended
-  (`turn/end` carries a reason): `completed`, `blocked` and `max-tokens` alert; `aborted`
-  (the user, a parent agent, a hook or disposal), `interrupted` and `forked` stay silent;
-  `error` alerts as a failure rather than as a completion.
+The turn's own log says why it ended (`turn/end` carries a reason): `completed`, `blocked`
+and `max-tokens` alert; `aborted` (the user, a parent agent, a hook or disposal),
+`interrupted` and `forked` stay silent. That log only ever refines an alert the status
+signal already raised — it never raises one by itself, because opening a session for the
+first time materializes its log, and the last turn of that log may have ended long before
+this page existed. Leaving a session retires this browser's event window for it, so a
+background session has none: the alert still fires from the status signal, and only these
+window-backed refinements — the reason, the failure text, and the latest prompt — fall back
+to their defaults.
 
 ### When it stays silent
 
 - you pressed stop / cancelled the turn (`aborted`, reason `user` or `parent`);
 - the turn was closed by a crash-repair or fork marker (`interrupted`, `forked`);
-- the turn belongs to an internal run: a subagent or teammate session
+- the row belongs to an internal run: a subagent or teammate session
   (`origin: 'subagent'`, or any session with a `parentId`), whose ends happen constantly
-  during ordinary work;
+  during ordinary work — and equally when this browser has no catalog row for it at all;
+- the row still has a direct child running (the sidebar shows the spinning dot, not the
+  green one);
 - the turn resumed before the debounce elapsed;
 - the matching switch is off, the master switch is off, or `notifyBackgroundOnly` is on and
   the window is in front.
+
+### What a toast says
+
+The title is always that session's `displayTitle` and carries no icon. The body opens with a
+status icon, then the work's name: it is the newest prompt the user themselves sent in that
+session, collapsed to one line and bounded to 120 characters, so a completion reads as the
+thing you asked for rather than as the session's auto-generated title. A user-role message is
+not always a prompt — injected context (workspace instructions, skill catalogs, teammate
+framing) arrives in the user role too — so only `source.kind === 'user'` counts.
+
+| Icon | Meaning |
+|---|---|
+| `🐳` | the completion alert for a turn that ended normally |
+| `🌀` | the completion alert for a turn that ended in an error |
+| `❗` | the reply-needed alert (a question, plan review, or approval is waiting) |
+
+The icon always leads the body, whatever the body turns out to be — your explicit text
+override, the failure message, the latest prompt, or the built-in copy — because it names the
+event rather than the text. Body precedence per alert is unchanged: your explicit text
+override, then (for a turn that ended in an error) the failure message, then the latest
+prompt, then the built-in copy. The session title never becomes the body. The settings page's
+**Send a test notification** button is not an alert, so its body has no icon.
+
+**An error is not a third alert.** It has no title, switch or tone of its own: a failed turn
+raises the completion alert with the completion sound and the completion switch, and the
+error message only supplies the body — its icon is `🌀` instead of `🐳`. The error title and
+body entries the settings dictionary used to carry are gone.
 
 ## Requirements
 
@@ -112,17 +150,6 @@ The OS sound of a notification is suppressed whenever this plugin already played
 sound for that event, so you never hear two alerts; with the plugin's sound off, the
 notification keeps the OS sound.
 
-### What a toast says
-
-The body names the work, not the session: it is the newest prompt the user themselves sent
-in that session, collapsed to one line and bounded to 120 characters, so a completion reads
-as the thing you asked for rather than as the session's auto-generated title. A user-role
-message is not always a prompt — injected context (workspace instructions, skill catalogs,
-teammate framing) arrives in the user role too — so only `source.kind === 'user'` counts.
-
-Body precedence per alert: your explicit text override, then (for a failed turn) the failure
-message, then the latest prompt, then the session title, then the built-in copy.
-
 ## Configuration
 
 Every preference is a Config field of this plugin's entry, so it can be set from the
@@ -133,7 +160,7 @@ from the Settings page:
 |---|---|---|
 | `enabled` | boolean, `true` | master switch for both sounds |
 | `volume` | number 0–1, `0.6` | playback volume, as a fraction of full scale |
-| `completionEnabled` | boolean, `true` | play a sound when a turn finishes |
+| `completionEnabled` | boolean, `true` | play a sound when a session row shows the green dot |
 | `completionTone` | string, `chime-up` | built-in tone used when no custom file is set |
 | `completionFile` | string, `''` | custom completion sound, as a data URL |
 | `completionDelayMs` | number 0–60000, `1200` | debounce before the completion alert; `0` disables it |
@@ -141,11 +168,11 @@ from the Settings page:
 | `waitingTone` | string, `ask-up` | built-in tone used when no custom file is set |
 | `waitingFile` | string, `''` | custom reply-needed sound, as a data URL |
 | `notifyEnabled` | boolean, `false` | raise a system notification in addition to the sound |
-| `notifyCompletion` | boolean, `true` | notify when a turn finishes |
+| `notifyCompletion` | boolean, `true` | notify when a session row shows the green dot |
 | `notifyWaiting` | boolean, `true` | notify when a reply is needed |
 | `notifyBackgroundOnly` | boolean, `true` | notify only while the window is not in front |
-| `notifyCompletionBody` | string, `''` | completion notification body; empty uses the built-in text |
-| `notifyWaitingBody` | string, `''` | reply notification body; empty uses the built-in text |
+| `notifyCompletionBody` | string, `''` | completion notification body; empty uses the built-in text (the status icon is prepended either way) |
+| `notifyWaitingBody` | string, `''` | reply notification body; empty uses the built-in text (the status icon is prepended either way) |
 
 The 8 built-in tones: `chime-up` (bright rise), `chime-down` (soft fall), `bell`, `ping`,
 `double`, `triple`, `ask-up` (light rise), `ask-down` (light fall). `completionFile` and
@@ -176,11 +203,12 @@ npm test        # node tests/smoke.mjs && node tests/host.mjs
 ```
 
 `tests/smoke.mjs` runs `lib/client.js` under stubbed browser globals and a stubbed Cordis
-context, then drives the session-status observable: the Settings section registers, controls
-write, both sounds fire, and the no-alert cases stay silent. `tests/host.mjs` runs
-`lib/index.js` against a stubbed Host context: the settings namespace registers and the entry
-Config reaches the page. No browser, no keys, no build; CI runs both on Linux, Windows and
-macOS.
+context, then drives the session-status and session-list observables: the Settings section
+registers, controls write, both sidebar-dot alerts fire, and the no-alert cases stay silent —
+including a subagent or teammate that finishes, a session with no catalog row, a parent
+whose child still runs, and a cancelled turn. `tests/host.mjs` runs `lib/index.js` against a
+stubbed Host context: the settings namespace registers and the entry Config reaches the
+page. No browser, no keys, no build; CI runs both on Linux, Windows and macOS.
 
 ### Layout
 
@@ -222,6 +250,11 @@ next start of dsh.
 - A notification is raised only when the window is not in front by default, so an active user
   is not interrupted by a toast about the thing already on screen.
 - Every open page of the profile alerts; the trigger is per profile, not per window.
+- The dot the plugin reads is the sidebar's own derivation, copied into the plugin: the
+  plugin never changes what the sidebar shows, and the two deliberate differences are that a
+  session on screen still alerts (the sidebar clears its own completion reminder for the
+  session you are reading) and that a cancelled turn stays silent (the sidebar may still
+  show the green dot).
 - A custom sound is stored whole in the settings value, so keep it a notification-length
   clip. Larger files are rejected with a message.
 - The built-in tones are Web Audio oscillators; nothing is fetched from the network.
