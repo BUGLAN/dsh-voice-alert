@@ -33,19 +33,37 @@ has a direct child running keeps showing the spinning dot instead of the green o
 parent that stops while its teammate works stays silent until the last child stops. That
 last child stopping is what turns the row green, and it alerts exactly once.
 
+One finished turn alerts once. The turn's own number is its identity, so re-reaching the same
+finished state — a repeated snapshot, or a running flag that blips while the session list
+catches up with the status stream — never raises the alert again; only a turn the log has
+actually advanced to does. When the turn cannot be named because the view had already retired
+the window, the stop that raised the alert carries the credit instead, so opening that session
+afterwards does not report the same stop a second time.
+
 The turn's own log says why it ended (`turn/end` carries a reason): `completed`, `blocked`
 and `max-tokens` alert; `aborted` (the user, a parent agent, a hook or disposal),
 `interrupted` and `forked` stay silent. That log only ever refines an alert the status
 signal already raised — it never raises one by itself, because opening a session for the
 first time materializes its log, and the last turn of that log may have ended long before
 this page existed. Leaving a session retires this browser's event window for it, so a
-background session has none: the alert still fires from the status signal, and only these
-window-backed refinements — the reason, the failure text, and the latest prompt — fall back
-to their defaults.
+background session has none: the sidebar's own unread mark (its green dot) still alerts, and
+only the window-backed refinements — the reason, the failure text, and the latest prompt —
+fall back to their defaults.
+
+The two signals are held to different standards, because only one of them already means
+"finished". The sidebar's unread mark is that dot, so it alerts by itself. This browser's own
+running-true→false observation is not: the session may have finished, or you may have stopped
+it, and only the durable log tells the two apart. So that edge alerts when a readable window
+proves the newest turn ended (`completed`, `blocked`, `max-tokens`) and stays silent when the
+turn was cancelled, still open, or unreadable. A session you stop and leave is the case that
+proves it: the view retires the window while the stop settles, and an idle edge with nothing
+left to prove it is not a finish.
 
 ### When it stays silent
 
 - you pressed stop / cancelled the turn (`aborted`, reason `user` or `parent`);
+- the session stopped while this browser could no longer read its turn: without a readable
+  end and without the sidebar's unread mark, an idle edge is a stop as easily as a finish;
 - the turn was closed by a crash-repair or fork marker (`interrupted`, `forked`);
 - the row belongs to an internal run: a subagent or teammate session
   (`origin: 'subagent'`, or any session with a `parentId`), whose ends happen constantly
@@ -91,6 +109,24 @@ body entries the settings dictionary used to carry are gone.
 - **Runtime** — the desktop app or the web UI. Sounds play in the page, so the page needs a
   user gesture at least once; notifications use the renderer's `Notification` API, which the
   desktop shell routes to the OS notification center.
+
+### System notifications on macOS
+
+The notification switch and the sound switches are independent, and the notification one is
+off by default **per machine**: with only the sounds on, macOS plays a tone and never raises a
+banner — which is usually the whole difference from a Windows machine where the toggle was
+turned on. To diagnose:
+
+1. Turn on **Enable system notifications** in Settings and press **Send a test notification**.
+   The page then reports the receipt: the system accepted it, or it got no receipt.
+2. On "no receipt", check **System Settings → Notifications → DeepSeek Harness**: allow
+   notifications, set the style to Banners, and make sure Focus is not silencing them.
+3. macOS only asks for authorization when this app posts its first notification, and it drops
+   that very notification. The plugin re-sends that first delivery once; if the first test
+   still shows nothing, press it again after allowing the system prompt.
+4. Clearing **Only while the window is not in front** makes alerts fire while the app is
+   frontmost too — but macOS tends to file a frontmost app's notifications straight into
+   Notification Center, so put the window behind another app while testing.
 
 ## Install
 
@@ -206,9 +242,10 @@ npm test        # node tests/smoke.mjs && node tests/host.mjs
 context, then drives the session-status and session-list observables: the Settings section
 registers, controls write, both sidebar-dot alerts fire, and the no-alert cases stay silent —
 including a subagent or teammate that finishes, a session with no catalog row, a parent
-whose child still runs, and a cancelled turn. `tests/host.mjs` runs `lib/index.js` against a
-stubbed Host context: the settings namespace registers and the entry Config reaches the
-page. No browser, no keys, no build; CI runs both on Linux, Windows and macOS.
+whose child still runs, a cancelled turn, and a stop whose event window the view has already
+retired. `tests/host.mjs` runs `lib/index.js` against a stubbed Host context: the settings
+namespace registers and the entry Config reaches the page. No browser, no keys, no build; CI
+runs both on Linux, Windows and macOS.
 
 ### Layout
 
@@ -251,10 +288,10 @@ next start of dsh.
   is not interrupted by a toast about the thing already on screen.
 - Every open page of the profile alerts; the trigger is per profile, not per window.
 - The dot the plugin reads is the sidebar's own derivation, copied into the plugin: the
-  plugin never changes what the sidebar shows, and the two deliberate differences are that a
-  session on screen still alerts (the sidebar clears its own completion reminder for the
-  session you are reading) and that a cancelled turn stays silent (the sidebar may still
-  show the green dot).
+  plugin never changes what the sidebar shows. Two deliberate differences follow from that:
+  a session on screen still alerts when its readable window proves the turn ended (the
+  sidebar clears its own completion reminder for the session you are reading), and a
+  cancelled turn stays silent (the sidebar may still show the green dot).
 - A custom sound is stored whole in the settings value, so keep it a notification-length
   clip. Larger files are rejected with a message.
 - The built-in tones are Web Audio oscillators; nothing is fetched from the network.

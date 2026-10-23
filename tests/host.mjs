@@ -14,18 +14,20 @@ assert.equal(moduleExports.name, 'voice-alert')
 assert.equal(moduleExports.NAMESPACE, 'voice-alert')
 assert.equal(moduleExports.BOOT_GLOBAL, '__DSH_VOICE_ALERT__')
 
-/** Minimal Cordis context: record the settings registration and the index injections. */
-function run(config) {
-  const registrations = []
+/** Namespace registrations the stub settings services recorded. */
+const registrations = []
+/** The settings service of a runtime that still exposes a namespace registration. */
+const registering = {
+  register: (ns, schema, options) => { registrations.push({ ns, schema, options }) },
+}
+
+/** Minimal Cordis context: run one apply() and return its index-inject listeners. */
+function run(config, settings = registering) {
   const listeners = new Map()
   const ctx = {
     inject: (deps, callback) => {
       assert.deepEqual(deps, ['settings'])
-      callback({
-        settings: {
-          register: (ns, schema, options) => { registrations.push({ ns, schema, options }) },
-        },
-      })
+      callback({ settings })
       return () => {}
     },
     on: (name, listener, options) => {
@@ -34,11 +36,11 @@ function run(config) {
     },
   }
   moduleExports.apply(ctx, config)
-  return { registrations, listeners }
+  return { listeners }
 }
 
 const defaults = moduleExports.Config({})
-const { registrations, listeners } = run(defaults)
+const { listeners } = run(defaults)
 
 // The namespace registration is what makes the settings durable when a provider is composed.
 assert.equal(registrations.length, 1, 'one namespace registered')
@@ -68,5 +70,14 @@ second.listeners.get('webserver/index-inject').listener(configuredTable)
 assert.ok(configuredTable[0].text.includes('"completionTone":"bell"'), 'a configured tone reaches the page')
 assert.ok(!configuredTable[0].text.includes('</script>'), 'a payload cannot close the script element')
 assert.ok(configuredTable[0].text.includes('\\u003c'), 'the payload escapes the angle bracket')
+
+// The current runtime serves `settings` as SettingsForms, which has no
+// `register`: the entry must still load and still publish its boot global.
+const beforeWithoutRegister = registrations.length
+const withoutRegister = run(defaults, {})
+assert.equal(registrations.length, beforeWithoutRegister, 'a settings service without register is tolerated')
+const fallbackTable = []
+withoutRegister.listeners.get('webserver/index-inject').listener(fallbackTable)
+assert.equal(fallbackTable.length, 1, 'the page injection survives a settings service without register')
 
 console.log('host: ok — namespace registration and page injection behave')

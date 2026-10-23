@@ -45,19 +45,40 @@ globalThis.document = {
   removeEventListener() {},
   hasFocus: () => documentFocused,
 }
+// Node publishes its own `navigator` (MacIntel on a Mac host), which would make
+// the platform checks under test depend on where the suite runs.
+/** Pin the platform the plugin reads, independent of the host running this suite. */
+function stubPlatform(platform) {
+  try {
+    Object.defineProperty(globalThis, 'navigator', { value: { platform }, writable: true, configurable: true })
+  } catch {
+    Object.defineProperty(globalThis.navigator, 'platform', { value: platform, configurable: true })
+  }
+  assert.equal(globalThis.navigator.platform, platform, 'the suite pins the platform it tests')
+}
+stubPlatform('Win32')
 const mirror = new Map()
 globalThis.localStorage = {
   getItem: (key) => (mirror.has(key) ? mirror.get(key) : null),
   setItem: (key, value) => { mirror.set(key, value) },
 }
-/** System-notification stand-in: records every raised notification. */
+/** System-notification stand-in: records every raised notification and permission ask. */
 const notifications = []
+const permissionRequests = []
 class FakeNotification {
   static permission = 'granted'
-  static requestPermission = () => Promise.resolve('granted')
+  static requestPermission = () => {
+    permissionRequests.push(true)
+    return Promise.resolve(FakeNotification.permission)
+  }
+  /** Whether a constructed notification confirms itself, as a shown banner would. */
+  static autoShow = false
   constructor(title, options) {
     notifications.push({ title, options })
     this.onclick = undefined
+    this.onshow = undefined
+    this.onerror = undefined
+    if (FakeNotification.autoShow) setTimeout(() => { this.onshow?.() }, 0)
   }
 }
 globalThis.Notification = FakeNotification
@@ -96,6 +117,9 @@ let values = {
   waitingFile: '',
 }
 let statusMap = new Map()
+/** Whether the stub settings scope reports a durable `user` layer, and what it holds. */
+let scopeHasUser = false
+let scopeUser
 const statusListeners = new Set()
 const listListeners = new Set()
 const scopeListeners = new Set()
@@ -106,7 +130,17 @@ let localized = ''
 let registered
 
 const scope = {
-  getSnapshot: () => ({ status: 'ready', value: { ...values }, revision: 1, writable: true, mode: 'host' }),
+  // `value` is the resolved config (schema defaults included); `user` is the
+  // durable edit layer a Host scope reports, present-but-empty when the profile
+  // stores nothing for this entry yet.
+  getSnapshot: () => ({
+    status: 'ready',
+    value: { ...values },
+    ...scopeHasUser ? { user: scopeUser } : {},
+    revision: 1,
+    writable: true,
+    mode: 'host',
+  }),
   subscribe: (listener) => { scopeListeners.add(listener); return () => { scopeListeners.delete(listener) } },
   set: (field, value) => { writes.push([field, value]); values = { ...values, [field]: value }; return Promise.resolve(true) },
   unset: () => Promise.resolve(true),
@@ -122,17 +156,49 @@ const userMessage = (text, kind = 'user') => ({
   type: 'event',
   event: { type: 'user/message', data: { source: { kind }, content: [{ type: 'text', text }] } },
 })
+/** Turn number the next fixture writes; every fixture advance is a new episode. */
+let fixtureTurn = 0
+const nextFixtureTurn = () => (fixtureTurn += 1)
 let turnEntries = [
   userMessage('帮我把登录流程重构一下，顺便补上测试'),
-  { type: 'event', event: { type: 'turn/start', data: { turn: 1 } } },
-  { type: 'event', event: { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } } },
+  { type: 'event', event: { type: 'turn/start', data: { turn: nextFixtureTurn() } } },
+  { type: 'event', event: { type: 'turn/end', data: { turn: fixtureTurn, reason: { kind: 'completed' } } } },
 ]
-/** Set one session's log tail to a turn closed for the given reason. */
-const closedTurn = (reason) => {
+/**
+ * Set one session's log tail to a turn closed for the given reason. Each call
+ * writes a new turn number, because the plugin tells turns apart by it; pass
+ * `null` for a tail whose log carries no user prompt at all.
+ */
+const closedTurn = (reason, text = '帮我把登录流程重构一下，顺便补上测试') => {
+  const turn = nextFixtureTurn()
   turnEntries = [
-    userMessage('帮我把登录流程重构一下，顺便补上测试'),
-    { type: 'event', event: { type: 'turn/start', data: { turn: 1 } } },
-    { type: 'event', event: { type: 'turn/end', data: { turn: 1, reason } } },
+    ...text === null ? [] : [userMessage(text)],
+    { type: 'event', event: { type: 'turn/start', data: { turn } } },
+    { type: 'event', event: { type: 'turn/end', data: { turn, reason } } },
+  ]
+}
+/** Set one session's log tail to a turn that is still running. */
+const openTurn = (text = '帮我把登录流程重构一下，顺便补上测试') => {
+  const turn = nextFixtureTurn()
+  turnEntries = [
+    ...text === null ? [] : [userMessage(text)],
+    { type: 'event', event: { type: 'turn/start', data: { turn } } },
+  ]
+}
+/**
+ * Close one more turn on top of the current log tail. Re-arming a completion by
+ * flipping `running` back on is only a new completion if the log advanced with
+ * it — a status push and a lagging list row can disagree about one stop, and
+ * that disagreement is what used to report a single turn twice. The turn number
+ * comes from the same counter as every other fixture, so no later fixture can
+ * reuse an episode that already alerted.
+ */
+const finishTurn = (reason = { kind: 'completed' }) => {
+  const turn = nextFixtureTurn()
+  turnEntries = [
+    ...turnEntries,
+    { type: 'event', event: { type: 'turn/start', data: { turn } } },
+    { type: 'event', event: { type: 'turn/end', data: { turn, reason } } },
   ]
 }
 
@@ -143,6 +209,8 @@ const bindings = {}
 const projections = {}
 /** Session-list arrival lifecycle: `pending` while the list RPC is in flight. */
 let listPhase = 'ready'
+/** Which settings-binder seat the plugin bound, to prove the current one wins. */
+let boundSeat = ''
 
 // Only a known top-level session row can own a sidebar status dot, so the
 // session under test needs one before anything may alert for it.
@@ -163,7 +231,11 @@ const pushRows = () => {
  */
 const pending = (key, kind = 'question') => ({ key, kind })
 const services = {
-  settingsScope: { bind: (spec) => { assert.equal(spec.namespace, 'voice-alert'); return scope } },
+  // The current client serves the binder as `webUiSettings`; `settingsScope` is
+  // only a deprecated property on that same object, so a plugin probing the old
+  // seat alone binds nothing and silently degrades to the local mirror.
+  webUiSettings: { bind: (spec) => { assert.equal(spec.namespace, 'voice-alert'); boundSeat = 'webUiSettings'; return scope } },
+  settingsScope: { bind: (spec) => { assert.equal(spec.namespace, 'voice-alert'); boundSeat = 'settingsScope'; return scope } },
   sessions: {
     list: {
       getSnapshot: () => ({ byId: sessionRows, projectionsBySession: projections, phase: listPhase }),
@@ -294,6 +366,7 @@ assert.ok(tonePlays.length > 0, 'a finished turn plays the completion sound')
 
 tonePlays.length = 0
 values = { ...values, enabled: false }
+finishTurn()
 pushStatus(new Map([['s1', { running: true, pendingInteraction: undefined }]]))
 pushStatus(new Map([['s1', { running: false, pendingInteraction: undefined }]]))
 assert.equal(tonePlays.length, 0, 'the master switch silences both sounds')
@@ -303,16 +376,21 @@ pushStatus(new Map([['s1', { running: true, pendingInteraction: undefined }]]))
 pushStatus(new Map([['s1', { running: false, pendingInteraction: pending('approval:1') }]]))
 assert.equal(tonePlays.length, 0, 'per-event switches silence each sound')
 
-values = { ...values, waitingEnabled: true, completionEnabled: true }
+values = { ...values, waitingEnabled: true, completionEnabled: false }
 tonePlays.length = 0
 pushStatus(new Map([['s1', { running: false, pendingInteraction: undefined }]]))
 pushStatus(new Map([['s1', { running: false, pendingInteraction: pending('approval:1') }]]))
-assert.ok(tonePlays.length > 0, 'a pending approval plays the waiting sound')
+assert.equal(tonePlays.length, 0, 'a reply key that already alerted does not alert again')
+pushStatus(new Map([['s1', { running: false, pendingInteraction: undefined }]]))
+pushStatus(new Map([['s1', { running: false, pendingInteraction: pending('approval:2') }]]))
+assert.ok(tonePlays.length > 0, 'a new pending approval plays the waiting sound')
+values = { ...values, completionEnabled: true }
 
 // ------------------------------------------------- system notifications
 
 notifications.length = 0
 values = { ...values, notifyEnabled: true, notifyCompletion: true, notifyWaiting: true, notifyBackgroundOnly: false }
+finishTurn()
 pushStatus(new Map([['s1', { running: true, pendingInteraction: undefined }]]))
 pushStatus(new Map([['s1', { running: false, pendingInteraction: undefined }]]))
 assert.equal(notifications.length, 1, 'a finished turn raises a system notification')
@@ -325,6 +403,52 @@ assert.equal(notifications[0].options.silent, true, 'the OS sound stays off whil
 pushStatus(new Map([['s1', { running: false, pendingInteraction: undefined }]]))
 assert.equal(notifications.length, 1, 'a repeated evaluation does not repeat the completion alert')
 
+// Nor is a running edge that only blips: a status push and a lagging list row
+// can disagree about one stop, and re-arming the alert on the edge alone used to
+// report the same finished turn a second time.
+pushStatus(new Map([['s1', { running: true, pendingInteraction: undefined }]]))
+pushStatus(new Map([['s1', { running: false, pendingInteraction: undefined }]]))
+assert.equal(notifications.length, 1, 'a running blip around one stop does not alert again')
+
+// A windowless completion alerts once too, even though opening the session
+// afterwards makes the very same turn readable: the stop that could not name its
+// turn keeps the credit, so the window cannot report it again.
+values = { ...values, notifyEnabled: true, notifyCompletion: true, notifyBackgroundOnly: false }
+sessionRows.bg2 = { displayTitle: '后台完成', running: true, blank: false, updatedAt: 10 }
+closedTurn({ kind: 'completed' })
+notifications.length = 0
+pushStatus(new Map([['bg2', { running: true, pendingInteraction: undefined }]]))
+pushStatus(new Map([['bg2', { running: false, completionUnread: true, pendingInteraction: undefined }]]))
+assert.equal(notifications.length, 1, 'a windowless completion alerts once')
+notifications.length = 0
+const emptyWindow = { getSnapshot: () => ({ entries: [] }), subscribe: () => () => {} }
+bindings.bg2 = { eventSource: emptyWindow }
+pushStatus(new Map([['bg2', { running: false, completionUnread: false, pendingInteraction: undefined }]]))
+bindings.bg2 = { eventSource: windowSource }
+pushRows()
+assert.equal(notifications.length, 0, 'opening the alerted session does not report the turn again')
+delete sessionRows.bg2
+delete bindings.bg2
+
+// A log that carries no turn number still tells its turns apart by event seq, so
+// two finished turns stay two alerts instead of collapsing into one episode.
+turnEntries = [
+  { type: 'event', event: { type: 'turn/start', seq: 41, data: {} } },
+  { type: 'event', event: { type: 'turn/end', seq: 42, data: { reason: { kind: 'completed' } } } },
+]
+notifications.length = 0
+pushStatus(new Map([['s1', { running: true, pendingInteraction: undefined }]]))
+pushStatus(new Map([['s1', { running: false, pendingInteraction: undefined }]]))
+assert.equal(notifications.length, 1, 'a turn named only by its event seq alerts')
+turnEntries = [
+  { type: 'event', event: { type: 'turn/start', seq: 43, data: {} } },
+  { type: 'event', event: { type: 'turn/end', seq: 44, data: { reason: { kind: 'completed' } } } },
+]
+pushStatus(new Map([['s1', { running: true, pendingInteraction: undefined }]]))
+pushStatus(new Map([['s1', { running: false, pendingInteraction: undefined }]]))
+assert.equal(notifications.length, 2, 'and the next turn is a new episode, not the same one')
+closedTurn({ kind: 'completed' })
+
 // The opt-in default is off, so nothing is raised until the user turns it on.
 values = { ...values, notifyEnabled: false }
 notifications.length = 0
@@ -335,6 +459,7 @@ assert.equal(notifications.length, 0, 'notifications are opt-in')
 // A body override wins over the built-in text.
 values = { ...values, notifyEnabled: true, notifyCompletionBody: '部署完成了' }
 notifications.length = 0
+finishTurn()
 pushStatus(new Map([['s1', { running: true, pendingInteraction: undefined }]]))
 pushStatus(new Map([['s1', { running: false, pendingInteraction: undefined }]]))
 assert.equal(notifications[0].options.body, '🐳 部署完成了',
@@ -348,6 +473,7 @@ pushStatus(new Map([['s1', { running: true, pendingInteraction: undefined }]]))
 pushStatus(new Map([['s1', { running: false, pendingInteraction: undefined }]]))
 assert.equal(notifications.length, 0, 'an in-focus window is not toasted')
 documentFocused = false
+finishTurn()
 pushStatus(new Map([['s1', { running: true, pendingInteraction: undefined }]]))
 pushStatus(new Map([['s1', { running: false, pendingInteraction: undefined }]]))
 assert.equal(notifications.length, 1, 'a window behind another app is toasted')
@@ -399,9 +525,102 @@ assert.equal(notifications[0].options.body, 'notify.completionBody',
   'the test button is not an alert, so its body carries no status icon')
 assert.equal(notifications[0].title, 'notify.completionTitle', 'the test button keeps its dictionary title')
 
+// The current binder seat is the one used; binding the deprecated name alone
+// used to leave the whole section on the browser-local mirror.
+assert.equal(boundSeat, 'webUiSettings', 'the current settings binder seat is bound')
+
+// A receipt is only reported once the OS confirms the notification.
+FakeNotification.autoShow = true
+notifications.length = 0
+assert.equal(notificationFace.testNotification(), true, 'the test button still reports a raised notification')
+await new Promise((resolve) => { setTimeout(resolve, 20) })
+assert.equal(notificationFace.notificationDelivery(), 'shown', 'a confirmed notification reports a receipt')
+
+// An unconfirmed one reports the missing receipt instead of claiming success.
+FakeNotification.autoShow = false
+notifications.length = 0
+finishTurn()
+pushStatus(new Map([['s1', { running: true, pendingInteraction: undefined }]]))
+pushStatus(new Map([['s1', { running: false, pendingInteraction: undefined }]]))
+assert.equal(notifications.length, 1, 'a completion alert is raised')
+assert.equal(notificationFace.notificationDelivery(), 'pending', 'an unconfirmed alert reports no receipt yet')
+await new Promise((resolve) => { setTimeout(resolve, 1700) })
+assert.equal(notificationFace.notificationDelivery(), 'failed', 'the missing receipt is reported')
+
+// A page that has never been asked keeps permission at `default`; the alert is
+// still raised (the desktop shell grants it) and the permission is requested,
+// instead of the alert disappearing without a trace.
+FakeNotification.permission = 'default'
+notifications.length = 0
+permissionRequests.length = 0
+values = { ...values, notifyEnabled: true, notifyCompletion: true, notifyBackgroundOnly: false, completionDelayMs: 0 }
+finishTurn()
+pushStatus(new Map([['s1', { running: true, pendingInteraction: undefined }]]))
+pushStatus(new Map([['s1', { running: false, pendingInteraction: undefined }]]))
+assert.equal(permissionRequests.length, 1, 'an alert due on the default permission asks for it')
+assert.equal(notifications.length, 1, 'a default permission still raises the alert')
+
+// A denied permission is reported, and nothing is raised.
+FakeNotification.permission = 'denied'
+notifications.length = 0
+finishTurn()
+pushStatus(new Map([['s1', { running: true, pendingInteraction: undefined }]]))
+pushStatus(new Map([['s1', { running: false, pendingInteraction: undefined }]]))
+assert.equal(notifications.length, 0, 'a denied permission raises nothing')
+assert.equal(notificationFace.notificationDelivery(), 'blocked', 'the denial is reported to the section')
+FakeNotification.permission = 'granted'
+
+// macOS asks for authorization while the first notification is already in
+// flight, so the OS drops exactly that one: the page retries the first
+// unconfirmed macOS post once, and never again.
+stubPlatform('MacIntel')
+notifications.length = 0
+finishTurn()
+pushStatus(new Map([['s1', { running: true, pendingInteraction: undefined }]]))
+pushStatus(new Map([['s1', { running: false, pendingInteraction: undefined }]]))
+assert.equal(notifications.length, 1, 'the first macOS alert is raised once')
+await new Promise((resolve) => { setTimeout(resolve, 1700) })
+assert.equal(notifications.length, 2, 'an unconfirmed first macOS alert is raised a second time')
+finishTurn()
+pushStatus(new Map([['s1', { running: true, pendingInteraction: undefined }]]))
+pushStatus(new Map([['s1', { running: false, pendingInteraction: undefined }]]))
+assert.equal(notifications.length, 3, 'a later macOS alert is raised once')
+await new Promise((resolve) => { setTimeout(resolve, 1700) })
+assert.equal(notifications.length, 3, 'the macOS retry is spent once per page')
+stubPlatform('Win32')
+
+// Durable layering: only the scope's own `user` layer may override the browser
+// mirror. Its resolved `value` carries schema defaults for every field, and
+// layering those on top would revert a preference this browser already stored the
+// first time a Host settings scope is bound.
+scopeHasUser = true
+scopeUser = undefined
+notificationFace.update({ notifyEnabled: true })
+values = { ...values, notifyEnabled: false, notifyWaiting: true, notifyBackgroundOnly: false }
+notifications.length = 0
+pushStatus(new Map([['s1', { running: false, pendingInteraction: undefined }]]))
+pushStatus(new Map([['s1', { running: false, pendingInteraction: pending('durable:1') }]]))
+assert.equal(notifications.length, 1, 'a mirrored preference survives a scope that stores no user edit')
+
+// A durable edit of the same field outranks the mirror, in both directions.
+scopeUser = { notifyEnabled: false }
+notifications.length = 0
+pushStatus(new Map([['s1', { running: false, pendingInteraction: undefined }]]))
+pushStatus(new Map([['s1', { running: false, pendingInteraction: pending('durable:2') }]]))
+assert.equal(notifications.length, 0, 'a durable user edit outranks the mirror')
+scopeUser = { notifyEnabled: true }
+notifications.length = 0
+pushStatus(new Map([['s1', { running: false, pendingInteraction: undefined }]]))
+pushStatus(new Map([['s1', { running: false, pendingInteraction: pending('durable:3') }]]))
+assert.equal(notifications.length, 1, 'a durable user edit raises the alert')
+scopeHasUser = false
+scopeUser = undefined
+mirror.delete('dsh-voice-alert/settings')
+
 // The prompt the user sent for that turn outranks the session title.
 notifications.length = 0
 values = { ...values, notifyEnabled: true, notifyBackgroundOnly: false, notifyCompletionBody: '' }
+finishTurn()
 pushStatus(new Map([['s1', { running: true, pendingInteraction: undefined }]]))
 pushStatus(new Map([['s1', { running: false, pendingInteraction: undefined }]]))
 assert.equal(notifications[0].options.body, '🐳 帮我把登录流程重构一下，顺便补上测试',
@@ -410,6 +629,7 @@ assert.equal(notifications[0].options.body, '🐳 帮我把登录流程重构一
 // An explicit override still outranks both.
 notifications.length = 0
 values = { ...values, notifyCompletionBody: '搞定了' }
+finishTurn()
 pushStatus(new Map([['s1', { running: true, pendingInteraction: undefined }]]))
 pushStatus(new Map([['s1', { running: false, pendingInteraction: undefined }]]))
 assert.equal(notifications[0].options.body, '🐳 搞定了', 'the user override outranks the prompt')
@@ -443,7 +663,7 @@ for (const reason of [
 }
 
 // A newer turn still open means the work continues: no "finished" alert.
-turnEntries = [{ type: 'event', event: { type: 'turn/start', data: { turn: 2 } } }]
+openTurn(null)
 tonePlays.length = 0
 pushStatus(new Map([['s1', { running: true, pendingInteraction: undefined }]]))
 pushStatus(new Map([['s1', { running: false, pendingInteraction: undefined }]]))
@@ -498,6 +718,7 @@ assert.equal(notifications[0].options.body, '🌀 帮我把登录流程重构一
 values = { ...values, notifyCompletionBody: '这轮炸了' }
 tonePlays.length = 0
 notifications.length = 0
+finishTurn({ kind: 'error' })
 pushStatus(new Map([['s1', { running: true, pendingInteraction: undefined }]]))
 pushStatus(new Map([['s1', { running: false, pendingInteraction: undefined }]]))
 assert.equal(notifications[0].options.body, '🌀 这轮炸了',
@@ -524,21 +745,16 @@ await sleep(140)
 assert.equal(tonePlays.length, 0, 'a resumed turn never reported the intermediate pause')
 
 values = { ...values, completionDelayMs: 0 }
-turnEntries = [
-  userMessage('帮我把登录流程重构一下，顺便补上测试'),
-  { type: 'event', event: { type: 'turn/start', data: { turn: 1 } } },
-  { type: 'event', event: { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } } },
-]
+closedTurn({ kind: 'completed' })
 pushStatus(new Map([['s1', { running: false, pendingInteraction: undefined }]]))
 
 // ------------------------------- the body names the turn the user asked for
 
 // An injected context reminder is user-role too, and it must not become the body.
 values = { ...values, notifyEnabled: true, notifyBackgroundOnly: false }
+closedTurn({ kind: 'completed' }, '把登录页的错误提示统一一下')
 turnEntries = [
-  userMessage('把登录页的错误提示统一一下'),
-  { type: 'event', event: { type: 'turn/start', data: { turn: 1 } } },
-  { type: 'event', event: { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } } },
+  ...turnEntries,
   userMessage('<system-reminder>Additional instructions from: AGENTS.md</system-reminder>', 'agent-instructions'),
 ]
 notifications.length = 0
@@ -549,10 +765,7 @@ assert.equal(notifications[0].options.body, '🐳 把登录页的错误提示统
 
 // Without a user prompt the body falls back to the built-in copy, never to the
 // session title: the title is the notification's title and nothing else.
-turnEntries = [
-  { type: 'event', event: { type: 'turn/start', data: { turn: 1 } } },
-  { type: 'event', event: { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } } },
-]
+closedTurn({ kind: 'completed' }, null)
 notifications.length = 0
 pushStatus(new Map([['s1', { running: true, pendingInteraction: undefined }]]))
 pushStatus(new Map([['s1', { running: false, pendingInteraction: undefined }]]))
@@ -561,11 +774,7 @@ assert.equal(notifications[0].options.body, '🐳 notify.completionBody',
   'a log without a user prompt falls back to the default body, still behind the icon')
 
 // A multi-line prompt collapses to one bounded line.
-turnEntries = [
-  userMessage(`第一行\n\n第二行   ${'很长'.repeat(90)}`),
-  { type: 'event', event: { type: 'turn/start', data: { turn: 1 } } },
-  { type: 'event', event: { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } } },
-]
+closedTurn({ kind: 'completed' }, `第一行\n\n第二行   ${'很长'.repeat(90)}`)
 notifications.length = 0
 pushStatus(new Map([['s1', { running: true, pendingInteraction: undefined }]]))
 pushStatus(new Map([['s1', { running: false, pendingInteraction: undefined }]]))
@@ -577,10 +786,7 @@ assert.ok(collapsed.length <= 123, 'the body is the icon plus a prompt bounded t
 
 // A row this browser has not loaded owns no sidebar dot, so it must stay silent
 // even when the turn ends: the row check fails closed, not open.
-turnEntries = [
-  { type: 'event', event: { type: 'turn/start', data: { turn: 1 } } },
-  { type: 'event', event: { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } } },
-]
+closedTurn({ kind: 'completed' }, null)
 delete sessionRows.s1
 tonePlays.length = 0
 notifications.length = 0
@@ -590,9 +796,10 @@ await sleep(20)
 assert.equal(tonePlays.length, 0, 'a session without a catalog row plays nothing')
 assert.equal(notifications.length, 0, 'a session without a catalog row notifies nothing')
 
-// A background session has no event window here at all: leaving it retires the
-// binding, so the window cannot be what proves the turn ended. The status
-// signal carries it and the alert still fires.
+// A stop this browser can no longer read is not a completion. The row is still
+// an ordinary top-level session, but the view has retired the event window, so
+// the idle edge has nothing to prove it was a finish: reporting one is the
+// false alert this guards against.
 sessionRows.s1 = { displayTitle: '重构登录流程', running: true, blank: false, updatedAt: 1 }
 delete bindings.s1
 pushStatus(new Map([['s1', { running: true, pendingInteraction: undefined }]]))
@@ -600,10 +807,24 @@ tonePlays.length = 0
 notifications.length = 0
 pushStatus(new Map([['s1', { running: false, pendingInteraction: undefined }]]))
 await sleep(20)
-assert.ok(tonePlays.length > 0, 'a windowless session still plays the completion sound')
-assert.equal(notifications.length, 1, 'a windowless session still raises a notification')
-assert.equal(notifications[0].options.body, '🐳 notify.completionBody',
-  'without a window the body falls back to the default text, still behind the icon')
+assert.equal(tonePlays.length, 0, 'a stop with no readable window plays nothing')
+assert.equal(notifications.length, 0, 'a stop with no readable window notifies nothing')
+
+// The reported shape: the session is stopped while on screen, the user leaves
+// it, and a later evaluation point — any other session's traffic — arrives once
+// the window is already retired. That stop must not be re-read as a finish.
+openTurn('继续')
+bindings.s1 = { eventSource: windowSource }
+tonePlays.length = 0
+notifications.length = 0
+pushStatus(new Map([['s1', { running: true, pendingInteraction: undefined }]]))
+pushStatus(new Map([['s1', { running: false, pendingInteraction: undefined }]]))
+assert.equal(tonePlays.length, 0, 'a stop whose window still shows the open turn plays nothing')
+delete bindings.s1
+pushStatus(new Map([['s1', { running: false, pendingInteraction: undefined }]]))
+await sleep(20)
+assert.equal(tonePlays.length, 0, 'leaving the stopped session does not turn the stop into a completion')
+assert.equal(notifications.length, 0, 'leaving the stopped session notifies nothing either')
 
 // A reply that is needed needs no window either.
 notifications.length = 0
@@ -614,11 +835,7 @@ pushStatus(new Map([['s1', { running: false, pendingInteraction: undefined }]]))
 
 // Back to a readable window for the cases that need one.
 bindings.s1 = { eventSource: windowSource }
-turnEntries = [
-  userMessage('帮我把登录流程重构一下，顺便补上测试'),
-  { type: 'event', event: { type: 'turn/start', data: { turn: 1 } } },
-  { type: 'event', event: { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } } },
-]
+closedTurn({ kind: 'completed' })
 
 // A teammate session is a subagent child: its own end and its own question are
 // never sidebar dots, and it owns no trigger even while its row is loaded.
@@ -679,10 +896,7 @@ delete sessionRows.child
 
 // The child row alone says it runs, with no status entry: the catalog fallback
 // still counts it, so the parent stays in the spinning state.
-turnEntries = [
-  { type: 'event', event: { type: 'turn/start', data: { turn: 1 } } },
-  { type: 'event', event: { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } } },
-]
+closedTurn({ kind: 'completed' }, null)
 projections.s1 = { values: { subagentCatalog: [{ id: 'child', createdAt: 0, mode: 'one-shot' }] } }
 sessionRows.child = { displayTitle: 'teammate', parentId: 's1', running: true, blank: false, updatedAt: 2 }
 notifications.length = 0
@@ -700,11 +914,7 @@ delete sessionRows.child
 // A session on screen is still worth alerting for: the sidebar shows its dot
 // whether or not it is the one you are looking at.
 sessionRows.s1 = { displayTitle: '重构登录流程', running: true, blank: false, updatedAt: 1 }
-turnEntries = [
-  userMessage('帮我把登录流程重构一下，顺便补上测试'),
-  { type: 'event', event: { type: 'turn/start', data: { turn: 1 } } },
-  { type: 'event', event: { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } } },
-]
+closedTurn({ kind: 'completed' })
 notifications.length = 0
 pushStatus(new Map([['s1', { running: true, pendingInteraction: undefined }]]))
 pushStatus(new Map([['s1', { running: false, pendingInteraction: undefined }]]))
@@ -751,23 +961,27 @@ await sleep(20)
 assert.equal(notifications.length, 0, 'a stop during the pending list phase stays silent')
 listPhase = 'ready'
 
-// ...and the same transition is reported once the list is ready, so the
-// baseline guard must not silence the main scenario.
+// ...and the same transition once the list is ready is still a stop, not a
+// finish: no window can be read and the sidebar marks no unread completion, so
+// nothing proves the turn ended and the plugin must stay silent.
 pushStatus(new Map([['s0', { running: true, pendingInteraction: undefined }]]))
 pushStatus(new Map([['s0', { running: false, pendingInteraction: undefined }]]))
 await sleep(20)
-assert.equal(notifications.length, 1, 'a stop after the list is ready still alerts')
+assert.equal(notifications.length, 0, 'a windowless stop after the list is ready stays silent')
+
+// The sidebar's own unread mark is the status signal that carries the alert,
+// window or no window; only the idle edge needs a durable turn to prove itself.
+pushStatus(new Map([['s0', { running: true, pendingInteraction: undefined }]]))
+pushStatus(new Map([['s0', { running: false, completionUnread: true, pendingInteraction: undefined }]]))
+await sleep(20)
+assert.equal(notifications.length, 1, 'the unread mark carries a windowless completion')
 delete sessionRows.s0
 
 // A pending interaction the sidebar does not turn yellow for is not a request
 // for a reply, and it must not hold back the completion alert either.
 sessionRows.s1 = { displayTitle: '重构登录流程', running: true, blank: false, updatedAt: 1 }
 bindings.s1 = { eventSource: windowSource }
-turnEntries = [
-  userMessage('帮我把登录流程重构一下，顺便补上测试'),
-  { type: 'event', event: { type: 'turn/start', data: { turn: 1 } } },
-  { type: 'event', event: { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } } },
-]
+closedTurn({ kind: 'completed' })
 notifications.length = 0
 pushStatus(new Map([['s1', { running: true, pendingInteraction: undefined }]]))
 pushStatus(new Map([['s1', { running: true, pendingInteraction: pending('wf:1', 'workflow-review') }]]))
@@ -778,9 +992,25 @@ assert.equal(notifications.length, 1, 'and it does not hold back the completion 
 pushStatus(new Map([['s1', { running: false, pendingInteraction: undefined }]]))
 
 // Two sessions stopping in the same evaluation point: the newest one reports at
-// once, and the other is deferred to its own debounce rather than dropped.
+// once, and the other is deferred to its own debounce rather than dropped. Both
+// windows are readable, so both ends are proven and neither is a stop.
+const finishedWindow = (text) => {
+  const turn = nextFixtureTurn()
+  return {
+    getSnapshot: () => ({
+      entries: [
+        userMessage(text),
+        { type: 'event', event: { type: 'turn/start', data: { turn } } },
+        { type: 'event', event: { type: 'turn/end', data: { turn, reason: { kind: 'completed' } } } },
+      ],
+    }),
+    subscribe: () => () => {},
+  }
+}
 sessionRows.a = { displayTitle: 'A', running: true, blank: false, updatedAt: 1 }
 sessionRows.b = { displayTitle: 'B', running: true, blank: false, updatedAt: 2 }
+bindings.a = { eventSource: finishedWindow('A 的提问') }
+bindings.b = { eventSource: finishedWindow('B 的提问') }
 notifications.length = 0
 pushStatus(new Map([
   ['a', { running: true, pendingInteraction: undefined }],
@@ -797,6 +1027,8 @@ assert.equal(notifications.length, 2, 'the losing candidate is deferred, not dro
 assert.equal(notifications[1].title, 'A', 'and it reports for its own session')
 delete sessionRows.a
 delete sessionRows.b
+delete bindings.a
+delete bindings.b
 
 // The newest-turn scan is reused while a session's window snapshot is
 // unchanged: an evaluation point must not rescan every long log it can see.
@@ -830,11 +1062,7 @@ delete bindings.probe
 // dot, no window. Opening it for the first time materializes its log, whose
 // last turn is a `turn/end` from before this page existed — that is not a
 // completion, so it must stay silent.
-turnEntries = [
-  userMessage('这是很久以前的提问'),
-  { type: 'event', event: { type: 'turn/start', data: { turn: 1 } } },
-  { type: 'event', event: { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } } },
-]
+closedTurn({ kind: 'completed' }, '这是很久以前的提问')
 sessionRows.idle = { displayTitle: '早就结束的会话', running: false, blank: false, updatedAt: 4 }
 tonePlays.length = 0
 notifications.length = 0

@@ -1,6 +1,8 @@
 # Installed dependencies. A checkout linked into a DSH profile may also carry a
 # node_modules junction to a local @deepseek-ai/schemastery; neither is source.
-node_modules/
+# The slash-less pattern covers the junction form too: git only matches a
+# directory pattern against a symlink-to-directory as a plain path.
+node_modules
 
 # Install and run residue.
 *.log
