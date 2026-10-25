@@ -94,7 +94,8 @@ override, the failure message, the latest prompt, or the built-in copy — becau
 event rather than the text. Body precedence per alert is unchanged: your explicit text
 override, then (for a turn that ended in an error) the failure message, then the latest
 prompt, then the built-in copy. The session title never becomes the body. The settings page's
-**Send a test notification** button is not an alert, so its body has no icon.
+**Send a test notification** button is not an alert, so its body has no icon — it does use
+the completion sound, so the probe checks audio and notification in one press.
 
 **An error is not a third alert.** It has no title, switch or tone of its own: a failed turn
 raises the completion alert with the completion sound and the completion switch, and the
@@ -107,7 +108,8 @@ body entries the settings dictionary used to carry are gone.
   `settings.section` slot (the 0.1.7 line and newer).
 - **Node.js** 22.19+ or 24+ for the dsh process that loads the Host half.
 - **Runtime** — the desktop app or the web UI. Sounds play in the page, so the page needs a
-  user gesture at least once; notifications use the renderer's `Notification` API, which the
+  user gesture at least once — an alert raised before that plays when audio unlocks;
+  notifications use the renderer's `Notification` API, which the
   desktop shell routes to the OS notification center.
 
 ### System notifications on macOS
@@ -180,7 +182,8 @@ Settings → **Sound alerts** (语音提醒), order 60, right after Agent preset
 - a **System notifications** block: its own switch, one switch per event, a
   notify-only-while-the-window-is-behind switch, optional body-text overrides per event, the
   current permission state, and a **Send a test notification** button that requests
-  permission and raises a real notification so you can see and place it.
+  permission, plays the completion sound, and raises a real notification so you can hear,
+  see and place it.
 
 The OS sound of a notification is suppressed whenever this plugin already played its own
 sound for that event, so you never hear two alerts; with the plugin's sound off, the
@@ -279,7 +282,8 @@ next start of dsh.
   here.
 - Sound plays in the browser page, so the page must have received a user gesture at least
   once (the ordinary browser autoplay rule). A pre-gesture `AudioContext` is resumed on the
-  next gesture.
+  next gesture, and an alert raised while it was suspended plays then instead of being lost
+  to the frozen timeline.
 - Notification permission: the DeepSeek Harness desktop shell grants non-media permissions
   from the owned window, so the switch works without a prompt there. In a plain browser the
   first enable or the test button triggers the browser prompt, and a denial is shown in the

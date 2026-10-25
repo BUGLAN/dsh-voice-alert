@@ -18,11 +18,21 @@ const React = {
   useState: (initial) => [initial, () => {}],
 }
 
+/** Contexts the fake created, so a test can suspend the live one. */
+const contexts = []
+/** Releases the pending resume() of a suspended fake context, as a gesture would. */
+let resumeWaiter = null
 class FakeAudioContext {
   state = 'running'
   currentTime = 0
   destination = {}
-  resume() {}
+  constructor() { contexts.push(this) }
+  resume() {
+    if (this.state === 'running') return Promise.resolve()
+    return new Promise((resolve) => {
+      resumeWaiter = () => { this.state = 'running'; resolve() }
+    })
+  }
   createOscillator() {
     tonePlays.push(this.currentTime)
     return { type: '', frequency: { value: 0 }, connect() {}, start() {}, stop() {} }
@@ -364,6 +374,20 @@ assert.equal(tonePlays.length, 0, 'answering leaves running state alone')
 pushStatus(new Map([['s1', { running: false, pendingInteraction: undefined }]]))
 assert.ok(tonePlays.length > 0, 'a finished turn plays the completion sound')
 
+// A page that has not seen a gesture keeps its AudioContext suspended: the
+// alert must not schedule its notes on the frozen timeline, and the tone
+// plays the moment the resume lands instead of being lost to the freeze.
+const suspendedContext = contexts[contexts.length - 1]
+suspendedContext.state = 'suspended'
+tonePlays.length = 0
+finishTurn()
+pushStatus(new Map([['s1', { running: true, pendingInteraction: undefined }]]))
+pushStatus(new Map([['s1', { running: false, pendingInteraction: undefined }]]))
+assert.equal(tonePlays.length, 0, 'a suspended context schedules no notes yet')
+resumeWaiter()
+await new Promise((resolve) => { setTimeout(resolve, 20) })
+assert.ok(tonePlays.length > 0, 'the held tone plays once the context resumes')
+
 tonePlays.length = 0
 values = { ...values, enabled: false }
 finishTurn()
@@ -519,10 +543,25 @@ values = { ...values, enabled: true }
 notifications.length = 0
 const notificationFace = sections[0].options.inject({ sync: () => {} })
 assert.equal(notificationFace.notificationPermission(), 'granted')
+// The probe is the page's end-to-end self-check: with the completion sound on it
+// plays that sound, and only a sound it actually played silences the OS one.
+tonePlays.length = 0
 assert.equal(notificationFace.testNotification(), true, 'the test button reports a raised notification')
 assert.equal(notifications.length, 1, 'the test button raises one notification')
+assert.ok(tonePlays.length > 0, 'the test button plays the completion sound')
+assert.equal(notifications[0].options.silent, true, 'a played probe sound keeps the OS sound off')
 assert.equal(notifications[0].options.body, 'notify.completionBody',
   'the test button is not an alert, so its body carries no status icon')
+
+// With the completion sound switched off the probe stays silent and leaves the
+// OS sound alone, so the toast is still audible on its own.
+values = { ...values, completionEnabled: false }
+notifications.length = 0
+tonePlays.length = 0
+assert.equal(notificationFace.testNotification(), true, 'the probe still raises a notification')
+assert.equal(tonePlays.length, 0, 'the probe plays nothing while the sound switch is off')
+assert.equal(notifications[0].options.silent, false, 'and it leaves the OS sound on')
+values = { ...values, completionEnabled: true }
 assert.equal(notifications[0].title, 'notify.completionTitle', 'the test button keeps its dictionary title')
 
 // The current binder seat is the one used; binding the deprecated name alone
